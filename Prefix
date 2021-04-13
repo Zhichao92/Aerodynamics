@@ -1,0 +1,14 @@
+import os
+import shutil
+import argparse
+
+parser = argparse.ArgumentParser(description='Remove all prefixes (GOPT, GEOM, VPMS, GRWS) from all files in directory')
+args = parser.parse_args()
+
+for f in os.listdir(os.getcwd()):
+	if(os.path.isdir(f)): continue
+	fsplit = f.split("_")
+	prefix = fsplit[0]
+	if("GOPT" in prefix):
+		fnew = "GEOM096E_"+f[len(fsplit[0])+1:]
+		shutil.move(f, fnew)
