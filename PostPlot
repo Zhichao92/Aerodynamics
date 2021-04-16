@@ -1,0 +1,806 @@
+"""Plotting functions."""
+
+import fordcfd
+from fordcfd.core import *
+import warnings
+# Ignore warnings about matplotlib font cache
+warnings.filterwarnings("ignore", category=UserWarning)
+from . import pflow
+from . import icon
+import matplotlib.pyplot as plt
+import numpy as np
+import imageio
+from imageio import imread
+import os
+import seaborn
+
+# Use default seaborn plot style
+seaborn.set(color_codes=True)
+cs_dat = [(0.21568627450980393, 0.49411764705882355, 0.7215686274509804),
+         (0.30196078431372547, 0.6862745098039216, 0.2901960784313726),
+         (0.8941176470588236, 0.10196078431372549, 0.10980392156862745),
+         (0.596078431372549, 0.3058823529411765, 0.6392156862745098),
+         (1.0, 0.4980392156862745, 0.0),
+         (0.6, 0.6, 0.6),
+         (1.0, 1.0, 0.2),
+         (0.6509803921568628, 0.33725490196078434, 0.1568627450980392),
+         (0.9686274509803922, 0.5058823529411764, 0.7490196078431373),
+         (0.8941176470588236, 0.10196078431372549, 0.10980392156862745)]
+def cs(i):
+    return cs_dat[i%len(cs_dat)]
+
+labels = {"cd": "C_d", "cl": "C_l", "cs": "C_s", "cmy": "C_{m_y}"}
+truncate_label_len = 50
+
+
+def get_unwv_maxs(case_dir):
+    def starttime(s):
+        return float(s.split("_")[-1].replace(".log", ""))
+    fpath = os.path.join(case_dir, "log")
+    fpath = os.path.join(fpath, "050_iconPiso*")
+    fpaths = sorted(glob.glob(fpath), key=starttime)
+    data = grep("Unwv:", fpaths[-1], usegrep=True)
+    max_ar = []
+    for dline in data.split("\n"):
+        dline = dline.replace("(", " ")
+        dline = dline.replace(")", " ")
+        d_ar = dline.split()
+        if(len(d_ar) != 19):
+            continue
+        max_val = float(d_ar[9])
+        if(max_val > 200.):
+            max_ar.append([max_val, float(d_ar[11]), float(d_ar[12]), float(d_ar[13])])
+    if(len(max_ar) == 0):
+        print("No high velocity regions found!")
+    return max_ar
+
+def plot_unvw_max(case_dir="./"):
+    print("Plotting side view of high velocity locations")
+    fig, ax = plt.subplots(1,1)
+
+    max_ar = get_unwv_maxs(case_dir)
+    max_vals = np.array(max_ar)
+
+    if(len(max_ar) > 0):
+        np.savetxt(os.path.join(case_dir, "results/umax_locs.csv"),max_vals[:,1:]*1E3)
+    else:
+        return
+
+    if(len(max_ar) == 0):
+        return 0
+    try:
+        fpath_rel="images/geometry/geometry-close-side.png"
+        fpath = os.path.join(case_dir, fpath_rel)
+        other_possible_paths = ["images/SRF_geometry_srf_view_side.jpg", "images/0-3.jpg",
+                                "images/0-3.png", "images/geom/close-side.png",
+                                "images/geom/close-side.jpg"]
+        if not os.path.isfile(fpath):
+            for p in other_possible_paths:
+                if (os.path.exists(os.path.join(case_dir, p))):
+                    fpath = os.path.join(case_dir, p)
+                    break
+
+        imdata = load_geom_side_view(fpath=fpath)[:, :, 0]/255
+        imdata = np.ma.masked_where(imdata == 1.0, imdata)
+    except:
+        print("Cant find vehicle side view, skipping u_max plot")
+        return 0
+
+    x = fordcfd.icon.get_pid_max_min(case_dir)
+    extent = [x[0][0], x[1][0], 0.0, x[1][2]]
+    xmin, xmax, ymin, ymax = extent
+    data_aspect = (xmax - xmin) / (ymax - ymin)
+    ax.imshow(1 - imdata, alpha=0.5, interpolation="none",
+              extent=extent)
+
+    ax.scatter(max_vals[:,1], max_vals[:,3], alpha = 0.5, label = "u_max > 200")
+    ax.plot(max_vals[-1,1], max_vals[-1,3], "r.", label = "last u_max = %2.2e" % max_vals[-1,0] )
+    ax.set_title("|U| > 200 (m/s) history")
+    plt.legend(loc = 'upper right')
+
+    savedir = check_figs_dir(case_dir=case_dir)
+    fig.savefig(os.path.join(savedir, "umax_loc.png"), dpi=300)
+
+
+def plot_force_devel(case_dir="./", case_type=None, component="cd",
+                     compare_case_dirs=[], compare_case_types=[],
+                     plot_geom=True, save=True, align_by = "axle",
+                     custom_wheel_names = None, savedir = "default"):
+    """Plot force (`cl` or `cd`) development."""
+    cases = [case_dir] + compare_case_dirs
+    case_types = [case_type]
+    if compare_case_types:
+        case_types += compare_case_types
+    else:
+        case_types += [None] * len(compare_case_dirs)
+    for i, (case, ctype) in enumerate(zip(cases, case_types)):
+        if(ctype is None):
+            case_types[i] = detect_case_type(case_dir=case)
+
+    cmaps = ["Blues", "Greens", "Reds", "Purples", "Oranges", "Greys", "YlOrBr"]
+    nrows = 1
+    if compare_case_dirs:
+        nrows = 2
+    fig, axes = plt.subplots(nrows=nrows)
+    if nrows == 1:
+        axes = [axes]
+    data_dict = {}
+    xmax = 0.0
+    for case, ctype in zip(cases, case_types):
+        data_dict[case] = load_force_devel(case_dir=case, case_type=ctype, custom_wheel_names = custom_wheel_names)
+    #get axle offsets
+    dxf = np.zeros(len(compare_case_dirs) + 1)
+    dxr = np.zeros(len(compare_case_dirs) + 1)
+    dxf_max = 0
+    dxr_max = 0
+    max_len = 0
+    if(align_by == "axle"):
+        try:
+            for i, (case, ctype) in enumerate(zip(cases, case_types)):
+                if(ctype == 'PowerFLOW'):
+                    (front_axle, rear_axle) = fordcfd.pflow.get_axle_locs(case, autogen=True, custom_wheel_names = custom_wheel_names)
+                elif(ctype == 'iconCFD'):
+                    (front_axle, rear_axle) = fordcfd.icon.get_axle_locs(case)
+                else:
+                    raise Exception("Unknown Case Type %s for %s, Exiting", (ctype, case))
+
+                x0 = data_dict[case]["x"][0]
+                dxf[i] = front_axle[0] - x0
+                dxr[i] = data_dict[case]["x"].max() - front_axle[0]
+            dxf_max = max(dxf)
+            dxr_max = max(dxr)
+            max_len = dxf_max + dxr_max
+        except:
+            print("warning: could not identify axle locations. In comparisons vehicles will be aligned by front!")
+            dxf_max = 0
+            for case in cases:
+                max_len = max(max_len, (data_dict[case]["x"].max() - data_dict[case]["x"][0]))
+    elif(align_by == "front"):
+        for case in cases:
+            max_len = max(max_len, (data_dict[case]["x"].max() - data_dict[case]["x"][0]))
+
+    y_max = -2
+    y_min = 2
+
+    heights = []
+    if plot_geom and compare_case_dirs:
+        for i, (case, ctype) in enumerate(zip(cases, case_types)):
+            if(ctype == "iconCFD"):
+                x = fordcfd.icon.get_pid_max_min(case)
+                heights.append(x[1][2] - x[0][2])
+            if(ctype == "PowerFLOW"):
+                x = fordcfd.pflow.get_vehicle_bbox(case)
+                heights.append(x[1][2] - x[0][2])
+    else:
+        heights = [1.0]
+    height_max = max(heights)
+
+    for i, (case, cmap) in enumerate(zip(cases, cmaps)):
+        case_name = fordcfd.detect_case_name(case_dir=case)
+        print("Plotting", component.title(), "development from", case_name)
+        ax = axes[0]
+        data = data_dict[case]
+        label = fordcfd.icon.clean_icon_name(case_name)
+        if len(label) > truncate_label_len:
+            label = label[:truncate_label_len] + "..."
+        x = data["x"].copy()
+        x += -x[0] + (dxf_max - dxf[i])
+        if x.max() > xmax:
+            xmax = x.max()
+        ax.plot(x, data[component], label=label, color = cs(i))
+        ax.set_xlim((0, xmax))
+        y_min = min(y_min, axes[0].get_ylim()[0])
+        y_max = max(y_max, axes[0].get_ylim()[1])
+    if plot_geom:
+        for i, (case, cmap) in enumerate(zip(cases, cmaps)):
+            x = data_dict[case]["x"].copy()
+            x -= x[0]
+            len_ratio = heights[i]/height_max
+            try:
+                plot_geom_side_view(case_dir=case, ax=ax, cmap=cmap,
+                                    aspect="equal", xmax=x.max(),
+                                    len_ratio=len_ratio, offset=dxf_max - dxf[i])
+                axes[0].set_ylim(y_min, y_max)
+            except FileNotFoundError:
+                print("Cannot find geometry side view image for {} "
+                      "development plot background".format(component.title()))
+
+    ax.set_xlabel("$x$ (m)")
+    ax.set_ylabel("Cumulative ${}$".format(labels[component]))
+    # If comparing cases, make a diff plot
+    y_max = -2
+    y_min = 2
+    if compare_case_dirs:
+        x_plot = np.linspace(0, max_len, len(data_dict[case]["x"]))
+        f0 = data_dict[cases[0]][component].copy()
+        x0 = data_dict[cases[0]]["x"].copy()
+        x0 += (-x0[0] + (dxf_max - dxf[0]))
+        f0 = np.interp(x_plot, x0, f0)
+
+        for i, (case, cmap) in enumerate(zip(cases, cmaps)):
+            if(i > 0):
+                f1 = data_dict[case][component].copy()
+                x1 = data_dict[case]["x"].copy()
+                x1 += (-x1[0] + (dxf_max - dxf[i]))
+
+                f1 = np.interp(x_plot, x1, f1)
+                f_diff = f1 - f0
+                axes[1].plot(x_plot, f_diff, color = cs(i))
+                y_max = max(y_max, max(f_diff))
+                y_min = min(y_min, min(f_diff))
+            else:
+                #x1 = x0.copy()
+                axes[1].set_xlabel("$x$ (m)")
+                axes[1].set_ylabel(
+                    "Cumulative $\Delta {}$".format(labels[component])
+                )
+                axes[1].set_xlim((0, max_len))
+            axes[1].set_ylim((y_min, y_max))
+
+    if plot_geom and compare_case_dirs:
+        for i, (case, cmap) in enumerate(zip(cases, cmaps)):
+            x1 = data_dict[case]["x"].copy()
+            x1 -= x1[0]
+            len_ratio = heights[i]/height_max
+            try:
+                plot_geom_side_view(case_dir=case, ax=axes[1], cmap=cmap,
+                                    aspect="equal", xmax=x1.max(),
+                                    len_ratio=len_ratio,offset= dxf_max - dxf[i])
+                axes[1].set_ylim((y_min, y_max))
+            except FileNotFoundError:
+                print("Cannot find geometry side view image for {} diff "
+                      "plot background".format(component))
+    if compare_case_dirs:
+        # Put legend on top subplot
+        ax.legend(loc="lower right")
+    fig.tight_layout()
+    if save and savedir == "default":
+        savedir = check_figs_dir(case_dir=case_dir,
+                                 compare_case_dirs=compare_case_dirs)
+        fig.savefig(os.path.join(savedir, "{}-devel.png".format(component)),
+                    dpi=300)
+    else:
+        fig.savefig(os.path.join(savedir, "{}-devel.png".format(component)),
+                    dpi=300)
+
+
+def get_moving_average(force, ma_window):
+    chunk = int(0.5*ma_window)
+    force_ma = np.zeros_like(force)
+    for i in range(len(force)-1, -1, -1):
+        f_window = min(len(force-1) - i, chunk)
+        r_window = min(i, chunk)
+        force_ma[i] = np.average(force[i-r_window:i+f_window])
+    return force_ma
+
+def plot_all_component_history(case_dir = "./", case_type = None):
+    print("Generating all component force history plot")
+    case_name = fordcfd.detect_case_name(case_dir)
+    data = load_force_history(case_dir=case_dir, case_type=case_type)
+    time = np.array(data["time"])
+    fig, ax = plt.subplots()
+    window = 0.25/(time[-1] - time[-2])
+    cd = data["cd"]
+    cd_ma = get_moving_average(cd, window)
+    cl = data["cl"]
+    cl_ma = get_moving_average(cl, window)
+    cs = data["cs"]
+    cs_ma = get_moving_average(cs, window)
+
+    ax.plot(time, cd, color = seaborn.color_palette("Paired", 20)[0], label = "Cd")
+    ax.plot(time, cd_ma, color = seaborn.color_palette("Paired", 20)[1])
+    ax.plot(time, cl, color = seaborn.color_palette("Paired", 20)[2], label = "Cl")
+    ax.plot(time, cl_ma, color = seaborn.color_palette("Paired", 20)[3])
+    ax.plot(time, cs, color = seaborn.color_palette("Paired", 20)[4], label = "Cs")
+    ax.plot(time, cs_ma, color = seaborn.color_palette("Paired", 20)[5])
+    ax.grid(which='minor')
+    ax.set_xlabel("Time (s)")
+    ax.legend()
+    start = int(len(cd)/20)
+    y_max = max(np.max(cd[start:]), np.max(cl[start:]), np.max(cs[start:]))
+    y_min = min(np.min(cd[start:]), np.min(cl[start:]), np.min(cs[start:]))
+
+    ax.set_ylim((y_min-0.01, y_max+0.01))
+
+    savedir = check_figs_dir(case_dir=case_dir)
+    fig.savefig(os.path.join(savedir, "all-component-history.png"),dpi=300)
+
+
+def geweke_convergence(x, frac1 = 0.1, frac2 = 0.5, zcutoff = 2):
+    """
+    Use method of Geweke to determine initial stablization time with T-test
+
+    Keyword arguments:
+    x -- data array
+    frac1 - fraction of signal evaluated for initial stablization period (if judged
+            not to be stabilized, subsequent frac1 chunks of array will be evald)
+    frac2 - fraction of signal assumed to be stabilized (taken from end)
+    zcutoff - zscore used to reject null hypothesis that means from frac1, frac2 are the same
+    """
+    A = int(frac1*len(x))
+    B = int(frac2*len(x))
+    n_discarded = 0
+    for i in range(5):
+        first = x[:A]
+        last = x[-B:]
+        s1 = get_mean_var(np.copy(first))
+        s2 = get_mean_var(np.copy(last))
+        mu1 = np.average(first)
+        mu2 = np.average(last)
+        zscore = (mu1-mu2)/(np.sqrt(s1+s2))
+        x = x[A:]
+        if(abs(zscore) < zcutoff):
+            break
+        n_discarded += A
+    return n_discarded
+
+
+def plot_stabilization(case_dir="./", case_type=None, component="cd", ma_window = 0.5, t_ave_start = None, compare_case_dirs = None, savedir = "default"):
+    """ Plot a moving average of force history to help judge stabilization"""
+    print("Plotting " + component.capitalize() + " Stabilization Plot")
+    cases = [case_dir]
+    if compare_case_dirs:
+        cases += compare_case_dirs
+
+    fig, ax = plt.subplots()
+    overall_max = -1E4
+    overall_min = 1E4
+    for j,c in enumerate(cases):
+
+        if(not os.path.exists(os.path.join(c,"results", component+"-history.csv"))):
+            data = load_force_history(case_dir=c, case_type=case_type)
+
+            time = data['time']
+            force = data[component]
+        else:
+            data = np.genfromtxt(os.path.join(c,"results", component+"-history.csv"), delimiter = ",", skip_header=1)
+            time = data[:,0]
+            force = data[:,1]
+
+
+
+        case_type = detect_case_type(case_dir=c)
+        case_name = fordcfd.detect_case_name(c)
+
+        if(case_type == "iconCFD"):
+            case_name = icon.clean_icon_name(case_name)
+
+        if(t_ave_start == None):
+            t_ave_start = fordcfd.get_averaging_start_time(case_dir=c, case_type=case_type)
+        if(t_ave_start > time[-1]):
+            t_ave_start = 0.0
+
+        if(len(force)%2 == 1):
+            force = force[1:]
+            time = time[1:]
+        dt = time[-1] - time[-2]
+
+        # chunk = int(0.5*ma_window/dt)
+        force_ma = np.zeros_like(force)
+        window = int(ma_window/dt)
+
+        force_ma = get_moving_average(force, window)#: #np.convolve(force, np.ones(window), 'same') /window
+        #hw = int(window/2)
+        #force_ma[:hw] = np.cumsum(force[:hw])/np.arange(1,hw+1)
+        #force_ma[-hw:] = (np.cumsum(force[-hw:][::-1])/np.arange(1,hw+1))[::-1]
+
+        start = np.searchsorted(time, t_ave_start)
+        t0 = 0
+        try:
+            t0 = geweke_convergence(np.copy(force[start:]))
+        except:
+            print("error with stabilzation detection")
+        t_stab = time[start + t0]
+
+
+        avg_default = round(np.average(force[start:]),3)
+        avg_tstab   = round(np.average(force[t0+start:]),3)
+
+        plot_case_name = case_name
+        if(len(case_name) > 30):
+            plot_cast_name = case_name[27:] + "..."
+        plot_component = component
+
+
+        ax.plot(time, force, color = cs(j), alpha = 0.5, label = case_name[:30], zorder = 2)
+        ax.plot(time, force_ma, color = cs(j), label = "moving avg", zorder = 10)
+        ax.axvline(t_ave_start,  color = 'black', label = r"avg start (%2.2f s  $\Rightarrow$ %s = %2.3f)" % (t_ave_start, "${}$".format(labels[component]), avg_default), zorder = 1)
+        ax.axvline(t_stab, linestyle="--", color = seaborn.color_palette("Paired", 20)[2*j+1], label = r"est. stabilization (%2.2f s $\Rightarrow$ %s = %2.3f)" % (t_stab, "${}$".format(labels[component]), avg_tstab))
+
+        start =int(len(force)/20)
+        overall_min = min(overall_min, np.min(force[start:]))
+        overall_max = max(overall_max, np.max(force[start:]))
+
+    ylim = np.array((overall_min -0.01, overall_max + 0.01))
+    ax.set_ylim(ylim)
+
+    hs, ls = ax.get_legend_handles_labels()
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("${}$".format(labels[component]))
+
+    orig = list(range(len(cases)*4))
+    lists = []
+    for i in range(len(cases)):
+        lists.append(orig[4*i:4*(i+1)])
+
+    hs_newi = []
+    for i in range(4):
+        for l in lists:
+            hs_newi.append(l[i])
+    hs_new = []
+    ls_new = []
+    for i in range(len(hs_newi)):
+        hs_new.append(hs[hs_newi[i]])
+        ls_new.append(ls[hs_newi[i]])
+
+    ax.legend(fontsize = 8, bbox_to_anchor=(1.13, 1.13), ncol = 4, handles = hs_new, labels = ls_new, loc = "upper right")
+    if(savedir == "default"):
+        savedir = check_figs_dir(case_dir=case_dir,
+                                 compare_case_dirs=compare_case_dirs)
+    fig.savefig(os.path.join(savedir, "{}-stabilization.png".format(component)),
+                dpi=300)
+
+
+def plot_force_history(case_dir="./", case_type=None, component="cd",
+                       compare_case_dirs=[], compare_case_types=[],
+                       save=True, backward_average=False,
+                       forward_average=False, forward_average_start_time=None,
+                       backward_average_end_time=None, frame1=None,
+                       filter=False, plot_averaging_line=True,
+                       write_csv=True, savedir = "default",
+                       write_zoom = True):
+    """Plot force coefficient time series."""
+    cases = [case_dir]
+    case_types = [case_type]
+    if compare_case_dirs:
+        cases += compare_case_dirs
+    if compare_case_types:
+        case_types += compare_case_types
+    else:
+        case_types += [None] * len(compare_case_dirs)
+    fig, ax = plt.subplots()
+    overall_max = -1e12
+    overall_min = 1e12
+    # Fraction of run beyond which to look for max and min
+    frac = 0.5
+    # Load data from each case first so we can decide if we need to normalize
+    # the time array
+    all_data = {}
+    tmax_list = []
+    for i, (case, ctype) in enumerate(zip(cases, case_types)):
+        all_data[case] = load_force_history(case_dir=case, case_type=ctype)
+        #all_data[case] = load_force_history(case_dir=case, case_type=ctype)
+        tmax_list.append(all_data[case]["time"].max())
+    normalize_time = np.max(tmax_list) / np.min(tmax_list) > 10
+    data_end_min = 2
+    data_end_max = -2
+    for i, (case, ctype) in enumerate(zip(cases, case_types)):
+        case_name = fordcfd.detect_case_name(case)
+        print("Plotting", component.title(), "history from", case_name)
+        if ctype is None:
+            ctype = detect_case_type(case_dir=case)
+        data = all_data[case]
+        start_index = int(len(data[component]) * frac)
+        data_seg = data[component][start_index:]
+        overall_max = max(overall_max, data_seg.max())
+        overall_min = min(overall_min, data_seg.min())
+        time = data["time"]
+        t_ave_start = forward_average_start_time
+        #if plot_averaging_line:
+        #    t_ave_start = fordcfd.get_averaging_start_time(case_dir=case,
+        #                                                   case_type=ctype)
+        if write_csv:
+            if not os.path.isdir(os.path.join(case, "results")):
+                os.makedirs(os.path.join(case, "results"))
+            df = pd.DataFrame()
+            df["time"] = time
+            df[component] = data[component]
+            try:
+                df.to_csv(os.path.join(case, "results",
+                                       component + "-history.csv"), index=False)
+            except PermissionError:
+                pass
+        if normalize_time:
+            tmax = time.max()
+            time /= tmax
+            timelabel = "Time (normalized)"
+            if t_ave_start:
+                t_ave_start /= tmax
+        else:
+            if ctype.lower() == "iconcfd" or ctype.lower() == "openfoam":
+                timelabel = "Iteration"
+                if fordcfd.foam.unsteady_case(case_dir=case):
+                    timelabel = "Time (s)"
+            else:
+                timelabel = "Time (s)"
+        label = fordcfd.icon.clean_icon_name(case_name)
+        if len(label) > truncate_label_len:
+            label = label[:truncate_label_len] + "..."
+        ax.plot(time, data[component], label=label,
+                alpha=0.5 if forward_average or backward_average or filter \
+                else 1.0, color = cs(i))
+        if plot_averaging_line:
+            fast = forward_average_start_time
+            if fast is None:
+                fast = fordcfd.get_averaging_start_time(case_dir=case)
+            if ((fast > time[-1]) and (time[-1] > 0.5)):
+                fast = 0.5
+            ax.axvline(fast, linestyle="dashed", color = cs(i))
+        if forward_average:
+            fast = forward_average_start_time
+            if fast is None:
+                fast = fordcfd.get_averaging_start_time(case_dir=case)
+            if frame1 is not None:
+                if ctype.lower() == "powerflow":
+                    time_info = fordcfd.pflow.get_time_info(case_dir=case)
+                    frame_ind = np.where(time_info.frame == frame1)[0][0]
+                    fast = time_info.timestep_start[frame_ind]
+            if normalize_time and fast is not None:
+                fast /= tmax
+            if ((fast > time[-1]) and (time[-1] > 0.5)):
+                fast = 0.5
+
+            time_ave, data_ave, data_std = fordcfd.forward_average(time, data[component],
+                                                         start_time=fast)
+            if(len(data_ave) == 0):
+                 print("No Cd/Cl averaging data found, skipping Cd/Cl averages ")
+                 continue
+            # Plot some arrows to show direction of averaging
+            n_arrows = 30
+            slice_size = int(len(time_ave) / n_arrows)
+            try:
+                ax.errorbar(time_ave, data_ave, yerr=data_std, label=label + " (forward-ave.)",
+                         marker=">", markevery=slice_size, errorevery=5*slice_size,
+                         color = cs(i), ecolor = 'black', elinewidth=1,
+                         capthick=1, barsabove=False, zorder = 10, capsize = 3)
+            except:
+                ax.plot(time_ave, data_ave, label=label + " (forward-ave.)",
+                    color = cs(i), marker=">", markevery=slice_size, zorder = 10)
+            write_csv = True
+            if write_csv:
+                if normalize_time:
+                    # Redimensionalize time before writing to CSV
+                    time_ave *= tmax
+                df = pd.DataFrame()
+                df["time"] = time_ave
+                df[component + "_forward_ave"] = data_ave
+                try:
+                    df.to_csv(os.path.join(case, "results",
+                              component + "-forward-ave.csv"), index=False)
+                except PermissionError:
+                    pass
+        if backward_average:
+            # Plot some arrows to show direction of averaging
+            n_arrows = 30
+            if normalize_time and backward_average_end_time is not None:
+                backward_average_end_time /= tmax
+            time_ave, data_ave, data_std = fordcfd.backward_average(time, data[component],
+                    end_time=backward_average_end_time)
+            if(len(data_ave) == 0):
+                print("No Cd/Cl averaging data found, skipping Cd/Cl averages ")
+                continue
+            slice_size = int(len(time_ave) / n_arrows)
+            try:
+                ax.errorbar(time_ave, data_ave, yerr=data_std, label=label + " (backward-ave.)",
+                     marker="<", markevery=slice_size, errorevery=5*slice_size,
+                     color = cs(i), ecolor = 'black', elinewidth=1,
+                     capthick=1, barsabove=False, zorder = 10)
+            except:
+                ax.plot(time_ave, data_ave, label=label + " (backward-ave.)",
+                        color = cs(i), marker="<", markevery=slice_size, zorder = 10)
+            if write_csv:
+                if normalize_time:
+                    # Redimensionalize time before writing to CSV
+                    time_ave *= tmax
+                df = pd.DataFrame()
+                df["time"] = time_ave
+                df[component + "_backward_ave"] = data_ave
+                try:
+                    df.to_csv(os.path.join(case, "results",
+                              component + "-backward-ave.csv"), index=False)
+                except PermissionError:
+                    pass
+        data_end_min = min(data_end_min, data_ave[-1])
+        data_end_max = max(data_end_max, data_ave[-1])
+        if filter:
+            # Skip first 2% of time steps to remove very large transients
+            t_smooth = time[len(time) // 50:]
+            f_smooth = data[component][len(time) // 50:]
+            f_smooth = fordcfd.smooth(f_smooth)
+            ax.plot(t_smooth, f_smooth, label=label + " (filtered)",
+                    linestyle="solid", color = cs(i), marker=None, linewidth=4, zorder = 1)
+    if compare_case_dirs or forward_average or backward_average or filter:
+        ax.legend(loc="best")
+    ax.set_xlabel(timelabel)
+    ax.set_ylabel("${}$".format(labels[component]))
+
+    # Set y-limit based on max and min overall
+    ylim = np.round(np.array((overall_min -0.01, overall_max + 0.01)),
+                        decimals=2)
+
+    ax.set_ylim(ylim)
+    fig.tight_layout()
+    if save:
+        if(savedir == "default"):
+            savedir = check_figs_dir(case_dir=case_dir,
+                                     compare_case_dirs=compare_case_dirs)
+        fig.savefig(os.path.join(savedir, "{}-history.png".format(component)),
+                    dpi=300)
+        if(data_end_min > data_end_max):
+            data_end_min = overall_min - 0.01
+            data_end_max = overall_max + 0.01
+        ylim = np.array((data_end_min - 0.005, data_end_max + 0.005))
+        ax.set_ylim(ylim)
+        if(write_zoom):
+            fig.savefig(os.path.join(savedir, "{}-history-zoom.png".format(component)),
+                        dpi=300)
+
+def plot_lift_history(**kwargs):
+    """Plot lift coefficient history."""
+    plot_force_history(component="cl", **kwargs)
+
+
+def plot_drag_history(**kwargs):
+    """Plot drag coefficient history."""
+    plot_force_history(component="cd", **kwargs)
+
+def load_geom_side_view(fpath="./images/geometry/geometry-close-side.png",
+                        px_trim_top=300, cutoff = 200):
+    """Load image of the geometry side view and trim.
+
+    See http://stackoverflow.com/questions/14211340/\
+    automatically-cropping-an-image-with-python-pil
+
+    Returns an array of trimmed image data.
+    """
+    # Find how many pixels to trim from the bottom by working out from center
+    image_data = imread(fpath)
+    image_data_bw = image_data.max(axis=2)
+    nrows, ncols = image_data_bw.shape
+    px_trim_bottom = 0
+    for n, row in enumerate(image_data_bw[nrows//2:]):
+        nrow_from_bottom = nrows//2 - n
+        if np.all(row > cutoff):
+            px_trim_bottom = nrow_from_bottom
+            break
+    image_data = image_data[px_trim_top:-px_trim_bottom, :]
+    image_data_bw = image_data.max(axis=2)
+    non_empty_columns = np.where(np.any(image_data_bw < cutoff, axis=0))[0]
+    non_empty_rows = np.where(np.any(image_data_bw < cutoff, axis=1))[0]
+    try:
+        crop_box = (np.min(non_empty_rows), np.max(non_empty_rows),
+                    np.min(non_empty_columns), np.max(non_empty_columns))
+        image_data_new = image_data[crop_box[0]:crop_box[1] + 1,
+                                    crop_box[2]:crop_box[3] + 1, :]
+    except ValueError:
+        # Could not detect crop box
+        image_data_new = np.ones(image_data.shape)
+    return image_data_new
+
+
+def plot_geom_side_view(case_dir="./",
+                        fpath_rel="images/geometry/geometry-close-side.png",
+                        ax=None, save=False, cmap="Blues", xmax=None,
+                        len_ratio=1.0, offset=0, **kwargs):
+    """Plot geometry side view."""
+    fpath = os.path.join(case_dir, fpath_rel)
+    other_possible_paths = ["images/geometry/geometry-close-side.jpg", "images/SRF_geometry_srf_view_side.jpg"]
+
+    if(len(glob.glob("images/geom*/0-3*")) > 0 ):
+        other_possible_paths.append(glob.glob("images/geom*/0-3*")[0])
+    if(len(glob.glob("images/geom*/close_side*")) > 0 ):
+        other_possible_paths.append(glob.glob("images/geom*/close_side*")[0])
+    if not os.path.isfile(fpath):
+        for p in other_possible_paths:
+            if(os.path.exists(os.path.join(case_dir, p))):
+                fpath = os.path.join(case_dir, p)
+                break
+    if ax is None:
+        fig, ax = plt.subplots()
+    imdata = load_geom_side_view(fpath=fpath)[:, :, 0]/255
+    imdata = np.ma.masked_where(imdata == 1.0, imdata)
+    extent = None
+    if "aspect" in kwargs.keys():
+        im_aspect = imdata.shape[0] / imdata.shape[1]
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        if xmax is None:
+            xmax = xlim[1]
+        extent = [xlim[0]+offset, xmax+offset, ylim[0],
+                  ylim[0] + (ylim[1] - ylim[0])*len_ratio]
+        xmin, xmax, ymin, ymax = extent
+        # data_aspect = (xlim[1] - xlim[0]) / (ylim[1] - ylim[0])
+        data_aspect = (xmax - xmin) / (ymax - ymin)
+    ax.imshow(1 - imdata, alpha=0.5, cmap=cmap, interpolation="none",
+              extent=extent, **kwargs)
+    if "aspect" in kwargs.keys():
+        ax.set_aspect(data_aspect*im_aspect)
+
+
+def plot_spectral_density(time, quantity, window=None, n_band_average=1,
+                          ax=None, xlabel=None, ylabel=None, **kwargs):
+    """Plot the spectral density of a given time series."""
+    f, s = fordcfd.calc_spectral_density(time, quantity, window=window,
+                                         n_band_average=n_band_average)
+    if ax is None:
+        fig, ax = plt.subplots()
+    ax.plot(f, s, **kwargs)
+    ax.set_xlabel("$f$ (Hz)" if xlabel is None else xlabel)
+    ax.set_ylabel("Spectral density" if ylabel is None else ylabel)
+    try:
+        fig.tight_layout()
+    except UnboundLocalError:
+        pass
+
+
+def plot_force_spectral_density(case_dir="./", compare_case_dirs=[],
+                                component="cd", save=True, n_band_average=1,
+                                window=None):
+    """Plot spectral density of a force coefficient."""
+    fig, ax = plt.subplots()
+    cases = [case_dir] + compare_case_dirs
+    for case in cases:
+        data = fordcfd.load_force_history(case_dir=case)
+        case_name = fordcfd.detect_case_name(case_dir=case)
+        print("Plotting {} spectrum from".format(component.title()), case_name)
+        i = [data["time"] >= fordcfd.get_averaging_start_time(case)]
+        plot_spectral_density(data["time"][i], data[component][i],
+                              label=case_name, ax=ax,
+                              n_band_average=n_band_average, window=window)
+    if compare_case_dirs:
+        ax.legend(loc="upper right")
+    ax.set_ylabel("${}$ spectral density".format(labels[component]))
+    ax.set_xlim((0, 10))
+    fig.tight_layout()
+    if save:
+        savedir = os.path.join(case_dir, "images")
+        if compare_case_dirs:
+            savedir = os.path.join(savedir, "compare")
+        if not os.path.isdir(savedir):
+            os.makedirs(savedir)
+        fig.savefig(os.path.join(savedir, component + "-spectrum.png"), dpi=300)
+
+
+def check_figs_dir(case_dir="./", compare_case_dirs=[]):
+    """Check for figures directory and create if it doesn't exist."""
+    figs_dir = os.path.join(case_dir, "images")
+    compare_figs_dir = os.path.join(figs_dir, "compare")
+    if not os.path.isdir(figs_dir):
+        os.makedirs(figs_dir)
+    if compare_case_dirs:
+        if not os.path.isdir(compare_figs_dir):
+            os.makedirs(compare_figs_dir)
+        return compare_figs_dir
+    else:
+        return figs_dir
+
+def plot_residuals(case_dir="./"):
+    print("Plotting CFD residuals")
+    try:
+        arr = fordcfd.icon.get_residuals(case_dir)
+    except:
+        print("Could not find residuals file, skipping residual plotting")
+        return 0
+
+    fig = plt.figure()
+    plt.semilogy(arr[0], arr[1], label = "ux_init_res", color=seaborn.color_palette("Paired", 10)[0])
+    plt.semilogy(arr[0], arr[2], label = "ux_fin_res",  color=seaborn.color_palette("Paired", 10)[1])
+    plt.semilogy(arr[0], arr[3], label = "uy_init_res", color=seaborn.color_palette("Paired", 10)[2])
+    plt.semilogy(arr[0], arr[4], label = "uy_fin_res",  color=seaborn.color_palette("Paired", 10)[3])
+    plt.semilogy(arr[0], arr[6], label = "uz_fin_res",  color=seaborn.color_palette("Paired", 10)[5])
+    plt.semilogy(arr[0], arr[5], label = "uz_init_res", color=seaborn.color_palette("Paired", 10)[4])
+    plt.semilogy(arr[0], arr[7], label = "p_init_res",  color=seaborn.color_palette("Paired", 10)[6])
+    plt.semilogy(arr[0], arr[8], label = "p_fin_res",   color=seaborn.color_palette("Paired", 10)[7])
+    plt.semilogy(arr[0], arr[9], label = "continuity",  color=seaborn.color_palette("Paired", 10)[8])
+    plt.legend(loc = (1.04, 0.3))
+    plt.xlabel("Time(s)", fontsize = 18)
+    plt.ylabel("Residual", fontsize = 18)
+    plt.xticks(fontsize = 16)
+    plt.yticks(fontsize = 16)
+    write_loc = os.path.join(case_dir, "images", "residuals.png")
+
+    fig.savefig(write_loc, dpi = 300, bbox_inches="tight")
+
+    header = "time (s), ux_initial_resisudal, ux_final_residuals, uy_initial_residual, uy_final_residual, uz_initial_residual, uz_final_residual, pressure_initial_resisudal, pressure_final_residaul, local_continiuty_residual"
+    arr = arr.T
+    np.savetxt(os.path.join(case_dir, "results", "residuals.dat"), arr, header = header)
