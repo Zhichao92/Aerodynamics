@@ -1,0 +1,170 @@
+import os
+import sys
+sys.path.append(os.path.dirname((os.path.dirname(__file__))))
+import icon
+import core
+import subprocess
+import glob
+import argparse
+
+parser = argparse.ArgumentParser(
+    description="icon queue status"
+)
+parser.add_argument("--lift", action = "store_true", default = False)
+parser.add_argument("--forward-ave-start", type = float)
+args = parser.parse_args()
+
+def split_into_jobs(lines):
+    jobs = []
+    job = []
+    for (i,l) in enumerate(lines):
+        if(len(l) == 0 and i > 0):
+            jobs.append(job)
+            job = []
+        elif (i > 0):
+            job.append(l)
+        i += 1
+    return jobs
+
+def is_icon(j):
+    for l in j:
+        if('Application:      ICONCFD' in l):
+            return True
+    return False
+
+def get_job_progress(case_dir, job_id):
+    fpath = os.path.join(case_dir, "log/*.log")
+    recent_log = sorted(glob.glob(fpath), key = os.path.getmtime)[-1]
+    if(job_id in recent_log):
+        return recent_log.split("_")[-2]
+    else:
+        return "-"
+
+def get_dt(case_dir):
+    fpath = os.path.join(case_dir, "system/controlDictFinal")
+    val = core.read_single_line_value("deltaT", fpath, index = -1)
+    return float(val.strip(';'))
+
+cmd = "fqstat -f"
+task = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE)
+data = task.stdout.read().decode('ascii')
+lines = data.split('\n')
+
+jobs = split_into_jobs(lines)
+jobs = [j for j in jobs if is_icon(j)]
+
+if(not args.lift):
+    print("-"*88)
+    print(" {0:<25} {1:<9} {2:<12} {3:<11} {4:<10} {5:<16}".format("Job Name", "Status", "t_elap (hr)", "t_rem (hr)", "t_cfd (s)", "Cd"))
+    print("-"*88)
+else:
+    print("-" * 140)
+    print(" {0:<25} {1:<9} {2:<12} {3:<11} {4:<10} {5:<16} {6:<16} {7:<16} {8:<16}".format("Job Name", "Status", "t_elap (hr)", "t_rem (hr)",
+                                                                   "t_cfd (s)", "Cd", "Cl", "Clf", "Clr"))
+    print("-" * 140)
+for j in jobs:
+    job_dict = {}
+
+    for l in j:
+        arr = l.split(":",1)
+        job_dict[arr[0]] = arr[1].strip()
+
+    try:
+        case_dir = job_dict['Run Directory']
+        job_id = job_dict['Job ID'].split(".")[0]
+        progress = "("+get_job_progress(case_dir, job_id)+")"
+        progress = progress.replace("icon", "").replace("Foam", "").replace("foam", "")
+    except:
+        progress = "(-)"
+
+    case_dir = job_dict['Run Directory']
+    job_name = job_dict['Job Name']
+    job_name = icon.clean_icon_name(job_name)
+    if(len(job_name) > 25):
+        job_name = job_name[:25]
+    job_status = job_dict['Job State'][0]
+    if(job_status == 'Q'):
+        progress = "(-)"
+    try:
+        solver_times = icon.get_solver_times(case_dir=case_dir)
+        df = icon.load_force_history(case_dir=case_dir)
+        nproc = icon.get_number_of_cpus(case_dir=case_dir)
+        endtime = icon.get_endtime(case_dir=case_dir)
+        current_time = solver_times["Simulated time (s)"]
+        clocktime_hrs = solver_times["Clock time (hr)"]
+        n_steps = solver_times["Number of Steps"]
+        time_per_step = float(current_time/n_steps)
+        dt = get_dt(case_dir)
+        steps_remaining = (endtime - current_time)/dt
+        cpu_hrs = clocktime_hrs*nproc
+        cpu_hrs_per_sec = cpu_hrs/current_time
+        #seconds_left = endtime - current_time
+        seconds_left = steps_remaining*time_per_step
+        cpu_hrs_left = cpu_hrs_per_sec*seconds_left
+        hrs_left = cpu_hrs_left/nproc
+        cd = df["cd"]
+        if(args.lift):
+            cl = df['cl']
+            clf = df['cl_front']
+            clr = df['cl_rear']
+
+
+        time = df["time"]
+        wall_time = solver_times['Total run time (hr)']
+        sim_time = solver_times['Simulated time (s)']
+        if(args.forward_ave_start is None):
+            ave_start_time = 0.5
+        else:
+            ave_start_time = args.forward_ave_start
+
+        if time.max() > ave_start_time:
+            cd = cd[time >= ave_start_time]
+            if(args.lift):
+                cl = cl[time >= ave_start_time]
+                clf = clf[time >= ave_start_time]
+                clr = clr[time >= ave_start_time]
+
+        ns = core.calc_indept_samples(cd)
+        cd_err = core.calc_confidence_interval(cd, interval = 0.95, i_samp = ns)
+        cd = cd.mean()
+
+        if(args.lift):
+            ns = core.calc_indept_samples(cl)
+            cl_err = core.calc_confidence_interval(cl, interval=0.95, i_samp=ns)
+            cl = cl.mean()
+
+            ns = core.calc_indept_samples(clf)
+            clf_err = core.calc_confidence_interval(clf, interval=0.95, i_samp=ns)
+            clf = clf.mean()
+
+            ns = core.calc_indept_samples(clr)
+            clr_err = core.calc_confidence_interval(clr, interval=0.95, i_samp=ns)
+            clr = clr.mean()
+
+        if(not args.lift):
+            print(" {0:<25} {1:<1}{2:<8} {3:<12.1f} {4:<11.1f} {5:<10.2f} {6:<5.4f} ± {7:<3.4f}".format(job_name, job_status, progress, wall_time, hrs_left, sim_time, cd, cd_err))
+        else:
+            print(" {0:<25} {1:<1}{2:<8} {3:<12.1f} {4:<11.1f} {5:<10.2f} {6:<5.4f} ± {7:<3.4f}  {8:<5.4f} ± {9:<3.4f}  {10:<5.4f} ± {11:<3.4f}  {12:<5.4f} ± {13:<3.4f}".format(job_name, \
+                    job_status, progress, wall_time, hrs_left, sim_time, cd, cd_err, cl, cl_err,  clf, clf_err, clr, clr_err))
+    except Exception as e:
+        wall_time = "-"
+        hrs_left = "-"
+        sim_time = "-"
+        cd = "-"
+        cd_err = ""
+        cl = "-"
+        cl_err = ""
+        clf = "-"
+        clf_err = ""
+        clr = "-"
+        clr_err = ""
+
+        if (not args.lift):
+            print(" {0:<25} {1:<1}{2:<8} {3:<12.1} {4:<11.1} {5:<10.2} -".format(job_name, job_status, progress, wall_time, hrs_left, sim_time))
+        else:
+            print(" {0:<25} {1:<1}{2:<8} {3:<12.1} {4:<11.1} {5:<10.2} -".format(job_name, job_status, progress, wall_time, hrs_left, sim_time))
+
+if(not args.lift):
+    print("-"*88)
+else:
+    print("-" *140)
