@@ -1,0 +1,142 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def pspec_noise(p_spec, seed = None):
+    """
+    Given the powerspectrum (p) of a signal, return a signal with same power spectrum but with randomized phases
+    
+    Keyword arguments:
+    p - The powerspectrum (all real values)
+    seed - seed value for random phases (if not set will use random seed)
+    
+    """
+    
+    if(seed is not None):
+        np.random.seed(seed)
+        
+    p_spec = np.array(p_spec, dtype='complex')    
+    freqs = np.fft.fftfreq(len(p_spec))
+    N = np.sum(freqs>0)    
+    phi = 2*np.pi*np.random.rand(N)
+    phi = np.cos(phi) + 1j * np.sin(phi)
+    p_spec[freqs>0] *= phi        
+    p_spec[-1:-1-N:-1] = np.conj(p_spec[freqs>0])    
+    
+    
+    return np.fft.ifft(p_spec).real
+
+def band_limited_noise(f_c, B, length, dt, mag = 1, seed = None):
+    """
+    Produce random bandwidth limited white noise
+    
+    Keyword arguments:
+    f_c -- central frequency (Hz)
+    B   -- bandpass witdh (Hz)
+    length  -- length of signal (s)
+    dt  -- step time of signal (s)
+    mag -- magnitude of signal  
+    
+    
+    """
+    min_freq = f_c - 0.5*B
+    max_freq = f_c + 0.5*B
+    
+    N = int(length/dt)
+    freqs = np.fft.fftfreq(N, dt)
+    p_spec = np.zeros(N)
+    
+    for i, f in enumerate(freqs):                
+        if (f > min_freq) and (f < max_freq):
+            p_spec[i] = mag
+        if (f < -min_freq) and (f > -max_freq):
+            p_spec[i] = mag
+    return pspec_noise(p_spec, seed)
+
+
+def rebin(data, n_bins):
+    """
+    rebin data array to n_bins
+    """
+    if(len(data) <  n_bins):
+        return data
+    chunk_size = int(len(data)/n_bins)
+    N = int(len(data)/chunk_size)
+    data_rebinned = np.zeros(N)
+    for i in range(N):
+        data_rebinned[i] = np.average(data[i*chunk_size:(i+1)*chunk_size])
+    return data_rebinned
+
+def get_rr_std(x, n_bins):
+    data_rebinned = rebin(x, n_bins)
+    return np.std(data_rebinned)
+
+def get_rr_var(x, n_bins):
+    data_rebinned = rebin(x, n_bins)
+    return np.var(data_rebinned)
+
+
+def rebin_continuous(data, n_bins):
+    """
+    return data binned into n_bins bins, interpolating to account for len(data)%n_bins != 0
+    """
+    N = len(data)/n_bins
+    data_rebinned = np.zeros((n_bins))
+    
+    for i in range(n_bins):
+        lower = i*N
+        lower_l = int(lower)
+        lower_r = lower_l + 1
+        
+        upper = (i+1)*N
+        upper_l = int(upper)
+        upper_r = upper_l + 1
+        
+        length = upper - lower
+        
+        data_rebinned[i] = np.sum(data[lower_r:upper_l])
+        if(lower_l > 0):
+            data_rebinned[i] += (data[lower_r] - data[lower_l])*(lower-lower_l)
+        if(upper_r < len(data)-1):
+            data_rebinned[i] += (data[upper_r] - data[upper_l])*(upper-upper_l)
+        data_rebinned[i] /= length
+    return data_rebinned
+
+def get_rr_var(x, n_bins):    
+    """
+    Get the estimated variance of a signal using repeat reference method (see [1])
+    
+    Keyword arguments:
+    x -- array to get repeat reference variance of
+    n_bins -- number of bins to divite the signal into
+    """    
+    x = x - x.mean()
+    data_rebinned = rebin_continuous(x, n_bins)
+    return np.var(data_rebinned)
+
+
+dt = 1E-3
+tlen = 50.0
+n = band_limited_noise(7.5, 15.0, tlen, dt)
+t = np.linspace(0.0, tlen, int(tlen/dt))
+
+df = pd.DataFrame(data=n, index=t)
+df=df.reset_index()
+df.columns=['time','noise']
+
+log_time = np.logspace(-2, 1, 50)
+var_rr = np.zeros_like(log_time)
+for j,t in enumerate(log_time):
+    ind = int(t/dt)                
+    n_bins = int(len(n)/ind)
+    var_rr[j] = np.sqrt(get_rr_var(n, int(len(n)/ind)))            
+
+
+plt.loglog(log_time, var_rr/np.std(n), ".", label='RR')
+plt.plot(df.time,1/np.sqrt(2*15*df.time),label='BL')
+plt.grid()
+plt.ylabel("s/$\sigma$")
+plt.xlabel("time (s)")
+plt.ylim(0.01,2)
+plt.xlim(0.01,10)
+
