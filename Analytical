@@ -1,0 +1,37 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def std(fl,fh):
+    tlen=100
+    dt=1e-3
+    t = np.linspace(1e-3, tlen, int(tlen/dt))
+    B=fh-fl
+    fc=fl+B/2
+    sih,ci=scipy.special.sici(2*np.pi*fh*t)
+    sil,ci=scipy.special.sici(2*np.pi*fl*t)
+    if fl==0:
+        s=1/(np.pi*B*t)*(sih-sil)
+    else:
+        s=1/(np.pi*B*t)*(sih-sil)
+        s-=fc/(np.pi**2*B*t**2)*(1/(fc**2-0.25*B**2))*np.sin(2*np.pi*fc*t)*np.sin(np.pi*B*t)
+        s-=1/(2*np.pi**2*t**2)*(1/(fc**2-0.25*B**2))*np.cos(2*np.pi*fc*t)*np.cos(np.pi*B*t)
+        s+=(1/(2*np.pi**2*t**2))*(1/(fc**2-0.25*B**2))
+    return np.sqrt(s)
+    #plt.loglog(t,s)
+   
+   
+t = np.linspace(1e-3, tlen, int(tlen/dt))
+s1=std(0,10)
+plt.loglog(t,s1,'b',label='fl=0,B=10')
+s2=std(0,100)
+plt.loglog(t,s2,'b',label='fl=0,B=100')
+s3=std(0,300)
+plt.loglog(t,s3,'b',label='fl=0,B=300')
+s4=std(1,11)
+plt.loglog(t,s4,'r',label='fl=!0,B=10')
+s5=std(1,101)
+plt.loglog(t,s5,'r',label='fl=!0,B=100')
+plt.grid()
+plt.legend()
+plt.show()
