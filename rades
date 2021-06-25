@@ -1,1 +1,118 @@
 a=(-np.square(np.sin(15*np.pi*df.time))+15*np.pi*df.time*si)/np.square(15*np.pi*df.time)
+
+df=pd.read_csv('cd-history.csv')
+
+import seaborn as sns
+sns.distplot(df.cd-df.cd.expanding(2).mean(), bins=60, hist_kws={'edgecolor':'black'})
+plt.xlim(-0.03,0.03)
+
+
+plot_spectral_density(df.time,df.cd)
+plt.xlim(0,100)
+plt.ylim(1e-9,1e-5)
+
+
+import scipy.signal
+def get_mean_var(x, n_divs_max = 50):
+    """
+    Use method of Mockett to get the estimated variance in the mean
+
+    Keyword arguments:
+    x -- array to get variance of
+    n_divs_max -- maximum number of divisions to use to find B_min
+    """
+    x = x - np.mean(x)
+    n_divs_max = min(n_divs_max, len(x))
+    rr_var = np.zeros((n_divs_max))
+    var = np.var(x)
+    for i in range(3,n_divs_max):
+        t = float(len(x))/i
+        rr_var[i] = var/(2*t*get_rr_var(x, i))
+    B = np.min(rr_var[3:])
+    return var/(2*B*len(x))
+
+
+def calc_indept_samples(values):
+    """
+    Compute number of independent samples
+    """
+    var = get_mean_var(np.copy(values))
+    return np.var(values)/var
+
+def calc_mean_std_err(values):
+    """Calculate the standard error of the mean of a time series."""
+    values = np.array(values)
+    print(len(values))
+    if len(values) > 1:
+        n = calc_indept_samples(values)
+        err = values.std() / np.sqrt(n)
+    else:
+        err = np.nan
+    return err
+
+
+def calc_confidence_interval(values, interval = 0.95, i_samp = 1):
+    """Calculate the confidence interval of the mean of a time series."""
+    values = np.array(values)
+    if len(values) > 1:
+        err = (values.std() / np.sqrt(i_samp))*two_tailed_t_score(interval, i_samp)
+    else:
+        err = np.nan
+    return err
+
+def forward_average(time, arr, start_time=None):
+    """Compute an array showing evolution of the mean as more samples are
+    included.
+
+    Returns
+    -------
+    time : numpy.ndarray
+        Time array over which averaging was performed.
+    ave_arr : numpy.ndarray
+        Fordward-averaged array.
+    """
+    time_t = np.array(time)
+    arr = np.array(arr)
+    if start_time is not None:
+        arr = arr[time >= start_time]
+        time_t = time[time >= start_time]
+    t_samp = 1
+    try:
+        t_samp = calc_indept_samples(arr)
+    except:
+        print("error in calculating independent samples, assuming n_samp = 1")
+    i_sample = np.linspace(0,t_samp,len(arr))
+    interval = 1.0 - (1.0 - 0.95)/2.0
+    std_arr = scipy.stats.t.ppf(interval, t_samp)*np.array(pd.Series(arr).expanding(2).std(ddof=0))/np.sqrt(i_sample)
+    ave_arr = np.array(pd.Series(arr).expanding(0).mean())
+    return time_t, ave_arr, std_arr
+    
+    
+    t,m,s=forward_average(df.time,df.cd-df.cd.mean(),start_time=1.5)
+    
+    
+    n_arrows = 60
+slice_size = int(len(t) / n_arrows)
+
+
+fig, ax = plt.subplots()
+ax.plot(df.time,df.cd-df.cd.mean(),alpha=0.5,label='Cd')
+#ax.plot(t,m,marker=">",markevery=slice_size, zorder = 10)
+ax.axvline(1.5, linestyle="dashed")
+ax.errorbar(t, m, yerr=s, label='Cd,avg',marker=">", markevery=slice_size, errorevery=5*slice_size,
+                        ecolor = 'black', elinewidth=1,
+                        capthick=1, barsabove=False, zorder = 10, capsize = 3)
+plt.xlim(0,16)
+plt.ylim(-0.025,0.025)
+ax.set_xlabel('Time[s]')
+    
+ax.set_ylabel('Normlized Cd')
+
+ax.legend(loc="best")
+plt.grid()
+fig.tight_layout()
+
+from matplotlib.pyplot import figure
+
+figure(figsize=(20, 15), dpi=500)
+    
