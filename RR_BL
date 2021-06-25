@@ -140,3 +140,95 @@ plt.xlabel("time (s)")
 plt.ylim(0.01,2)
 plt.xlim(0.01,10)
 
+
+
+def calc_spectral_density(t, data, window=None, n_band_average=1):
+    """Compute one-sided power spectral density, subtracting mean automatically.
+
+    Parameters
+    ----------
+    t : Time array
+    data : Time series data
+    window : {None, "Hanning"}
+    n_band_average : Number of samples over which to band average
+
+    Returns
+    -------
+    f : Frequency array
+    psd : Spectral density array
+    """
+    dt = t[1] - t[0]
+    N = len(data)
+    data = data - np.mean(data)
+    if window == "Hanning":
+        data = data*np.hanning(N)
+    f = np.fft.fftfreq(N, dt)
+    y = np.fft.fft(data)
+    f = f[0:int(N/2)]
+    psd = (2*dt/N)*abs(y)**2
+    psd = np.real(psd[0:int(N/2)])
+    if n_band_average > 1:
+        f_raw, s_raw = f*1, psd*1
+        f = np.zeros(len(f_raw)//n_band_average)
+        psd = np.zeros(len(f_raw)//n_band_average)
+        for n in range(len(f_raw)//n_band_average):
+            f[n] = np.mean(f_raw[n*n_band_average:(n+1)*n_band_average])
+            psd[n] = np.mean(s_raw[n*n_band_average:(n+1)*n_band_average])
+    return f, psd
+
+
+def plot_spectral_density(time, quantity, window=None, n_band_average=1,
+                          ax=None, xlabel=None, ylabel=None, **kwargs):
+    """Plot the spectral density of a given time series."""
+    f, s = calc_spectral_density(time, quantity, window=window,
+                                         n_band_average=n_band_average)
+    if ax is None:
+        fig, ax = plt.subplots()
+    ax.plot(f, s, **kwargs)
+    ax.set_xlabel("$f$ (Hz)" if xlabel is None else xlabel)
+    ax.set_ylabel("Spectral density" if ylabel is None else ylabel)
+    try:
+        fig.tight_layout()
+    except UnboundLocalError:
+        pass
+
+
+
+
+
+
+
+
+from random import gauss
+from random import seed
+from pandas import Series
+from pandas.plotting import autocorrelation_plot
+# seed random number generator
+seed(1)
+# create white noise series
+series = [gauss(0.0, 1.0) for i in range(100000)]
+series = Series(series)
+
+dt = 1E-5
+tlen = 1.0
+time = np.linspace(0.0, tlen, int(tlen/dt)+1)
+n=np.array(series)
+plot_spectral_density(time,series)
+plt.xlim(0,60000)
+
+
+log_time = np.logspace(-4, 0, 100)
+var_rr = np.zeros_like(log_time)
+for j,t in enumerate(log_time):
+    ind = int(t/dt)                
+    n_bins = int(len(n)/ind)
+    var_rr[j] = np.sqrt(get_rr_var(n, int(len(n)/ind)))   
+
+plt.loglog(log_time[:-15], var_rr[:-15]/np.std(n), ".", label='RR')
+plt.plot(time,1/np.sqrt(2*50000*time),'y-',label='BL')
+plt.plot(time,1/np.sqrt(2*42268*time),'b--',label='BL')
+plt.grid()
+plt.ylabel("s/$\sigma$")
+plt.xlabel("time (s)")
+#plt.ylim(0.0001,0.5)
+#plt.xlim(0.0001,1)
