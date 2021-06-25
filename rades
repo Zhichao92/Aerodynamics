@@ -1,0 +1,1 @@
+a=(-np.square(np.sin(15*np.pi*df.time))+15*np.pi*df.time*si)/np.square(15*np.pi*df.time)
