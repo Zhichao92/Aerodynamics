@@ -1,0 +1,909 @@
+"""PowerPoint creation functions."""
+
+from __future__ import division, print_function
+from pptx import Presentation
+from pptx.util import Inches, Px, Pt
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+import datetime
+import os
+from fordcfd.core import *
+import fordcfd.plotting
+from . import pflow, icon
+from PIL import Image
+from subprocess import call
+import glob
+import warnings
+import shutil
+import bisect
+#from collections import OrderedDict
+import collections
+
+# Ignore warnings about Px class in pptx
+warnings.filterwarnings("ignore", category=UserWarning)
+
+top_clearance = 0.7
+
+name_codex = {}
+name_codex["html_report"] = "Summary"
+name_codex["geom"] = "Geometry"
+name_codex["unwv_surf"] = "Velocity Surfaces"
+name_codex["md_surf"] = "Drag Surface"
+name_codex["p_clip"] = "Cp Clips"
+name_codex["pi_clip"] = "Cp Internal Clips"
+name_codex["p_surf"] = "Cp Surface"
+name_codex["q_iso"] = "Q Isosurfaces"
+name_codex["cpt_iso"] = "Cp,total Isosurfaces"
+name_codex["u_clip"] = "Velocity Clips"
+name_codex["ui_clip"] = "Velocity Internal Clips"
+name_codex["yp_surf"] = "Y+ Clips"
+name_codex["mesh_clip"] = "Mesh Clips"
+
+def add_title_slide(prs, case_name="", compare_case_dirs=[]):
+    """Create title slide."""
+    case_names = [case_name]
+    for c in compare_case_dirs:
+        case_names.append(detect_case_name(case_dir=c))
+    blank_slide_layout = prs.slide_layouts[0]
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.name = "Title"
+    title = slide.shapes.title
+    subtitle = slide.placeholders[1]
+    title.text = " vs. ".join(case_names)
+    timetxt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subtitle.text = "Generated {} by fordcfd-post v{}".format(timetxt,
+            fordcfd.__version__)
+
+
+def add_image_slide(prs, img_fpath, index_slide, title=""):
+    img_name = os.path.basename(img_fpath)
+    if "history" in img_name or "devel" in img_name or "spectrum" in img_name or "stabilization" in img_name:
+        title = img_name.replace(".png", "")
+        title = title.split("-")
+        title = title[0].title() + " " + title[1]
+        if title.endswith("devel"):
+            title = title.replace("devel", "development")
+    blank_slide_layout = prs.slide_layouts[5]
+    slide = prs.slides.add_slide(blank_slide_layout)
+    slide.name = title
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+    left = Inches(0.25)
+    top = Inches(top_clearance)
+    width = Inches(9.5) # Slides are 10 in wide
+    height = Inches(6.25) # Slides are 7.5 in tall
+    slide_aspect_ratio = slide_width/slide_height
+    img_area_aspect_ratio = width/height
+    title_shape = slide.shapes.title
+    title_shape.text = title
+    # Check if image is either tall or wide
+    size = Image.open(img_fpath).size
+    img_aspect_ratio = size[0] / size[1]
+    if img_aspect_ratio > img_area_aspect_ratio:
+        slide.shapes.add_picture(img_fpath, left, top, width=width)
+    else:
+        # Adjust left padding
+        img_height_scale = height/Px(size[1])
+        left = (slide_width - Px(size[0])*img_height_scale)/2
+        slide.shapes.add_picture(img_fpath, left, top, height=height)
+
+    textbox = slide.shapes.add_textbox(Inches(9.0), Inches(7.05), Inches(1), Inches(0.3))
+    tf = textbox.text_frame
+    rId = slide.part.relate_to(index_slide.part, RT.SLIDE)
+    tf.add_paragraph()
+    r = tf.paragraphs[0].add_run()
+    r.text = "Index"
+    rPr = r._r.get_or_add_rPr()
+    hlinkClick = rPr.add_hlinkClick(rId)
+    hlinkClick.set('action', 'ppaction://hlinksldjump')
+
+    prev_box = slide.shapes.add_textbox(Inches(8.25), Inches(7.05), Inches(1), Inches(0.3))
+    next_box = slide.shapes.add_textbox(Inches(7.5), Inches(7.05), Inches(1), Inches(0.3))
+    return (prev_box, next_box)
+
+def add_index_slide(prs):
+    """Add and index slide to the presentation
+
+    returns the index table with number of columns and rows for later modification
+
+    Parameters
+    ----------
+    prs : pptx.Presentation
+        Presentation object to which slide should be added.
+    """
+    title_only_slide_layout = prs.slide_layouts[5]
+    slide = prs.slides.add_slide(title_only_slide_layout)
+    slide.name = "Index"
+    title_shape = slide.shapes.title
+    title_shape.text = "Index"
+    left = Inches(0.25)
+    top = Inches(top_clearance)
+    width = Inches(9.5)
+    height = Inches(0.5)
+    cols = 3
+    rows = 8
+    shapes = slide.shapes
+    table = shapes.add_table(rows, cols, left, top, width, height).table
+    table.cell(0,0).text = "Index"
+    table.horz_banding = False
+    return (table, rows, cols)
+
+def add_table_slide(prs, props_dict_list, keylist, index_slide, title="", fontsize=16, short_names=None):
+    """Add slide with a table.
+
+    Rows will be set according to `keylist`, and columns will be taken
+    sequentially from `props_dict_list`.
+
+    Parameters
+    ----------
+    prs : pptx.Presentation
+        Presentation object to which slide should be added.
+    props_dict_list : list of dicts
+        List with dictionaries from each case to tabulate.
+    keylist : list
+        List of dictionary keys to use as rows in table.
+    """
+    title_only_slide_layout = prs.slide_layouts[5]
+    slide = prs.slides.add_slide(title_only_slide_layout)
+    slide.name = title
+    shapes = slide.shapes
+    shapes.title.text = title
+    left = Inches(0.25)
+    top = Inches(top_clearance)
+    width = Inches(9.5)
+    height = Inches(0.5)
+    cols = len(props_dict_list) + 1
+    rows = len(keylist) + 1
+    table = shapes.add_table(rows, cols, left, top, width, height).table
+    # Set column width
+    table.columns[0].width = Inches(2.5)
+    # Write column headings
+    table.cell(0, 0).text = "Property"
+    for i, d in enumerate(props_dict_list):
+        if(short_names is None):
+            table.cell(0, i + 1).text = "Case {n}".format(n=i + 1)
+        else:
+            table.cell(0, i + 1).text = "Case %d (%s)" % (i + 1, short_names[i])
+        table.columns[i + 1].width = Inches(7.0/len(props_dict_list))
+    for j, case in enumerate(props_dict_list):
+        for i, kw in enumerate(keylist):
+            table.cell(i + 1, 0).text = str(kw)
+            val = ""
+            if(kw in case):
+                val = case[kw]
+            try:
+                if np.abs(val) >= 1e4 or np.abs(val) < 1e-3 and val != 0.0:
+                    val = "{:.1e}".format(val)
+            except:
+                pass
+            table.cell(i + 1, j + 1).text = str(val)
+    for icol in range(cols):
+        for irow in range(rows):
+            cell = table.rows[irow].cells[icol]
+            paragraph = cell.textframe.paragraphs[0]
+            paragraph.font.size = Pt(fontsize)
+    textbox = slide.shapes.add_textbox(Inches(9.0), Inches(7.05), Inches(1), Inches(0.3))
+    tf = textbox.text_frame
+    rId = slide.part.relate_to(index_slide.part, RT.SLIDE)
+    tf.add_paragraph()
+    r = tf.paragraphs[0].add_run()
+    r.text = "Index"
+    rPr = r._r.get_or_add_rPr()
+    hlinkClick = rPr.add_hlinkClick(rId)
+    hlinkClick.set('action', 'ppaction://hlinksldjump')
+
+
+def add_summary_table_slide(prs, index_slide, case_dir="./", compare_case_dirs=[],
+                            remove_empty_rows=False, frontal_area=None, forward_ave_start = None, short_names = None):
+    """Add summary slide for case results."""
+    keys = ["Case name", "Working directory", "Case type", "Solver version",
+            "Velocity (m/s)", "Time steps", "Steady/unsteady",
+            "Averaging Start (s)", "Simulated time (s)", "Total run time (hr)",
+            "CPUs", "CPU hours", "Cells/voxels", "Max refinement",
+            "Max ref. cells/voxels", "Meshing time (hr)"]
+    props_dict_list = []
+    case_dirs = [case_dir] + compare_case_dirs
+    for case in case_dirs:
+        d = summary(case_dir=case, frontal_area=frontal_area, forward_ave_start = forward_ave_start)
+        props_dict_list.append(d)
+    if remove_empty_rows:
+        not_empty_keys = []
+        for d in props_dict_list:
+            for key in keys:
+                if d[key] and not key in not_empty_keys:
+                    not_empty_keys.append(key)
+        keys = not_empty_keys
+    # Font size is proportional to number of cases in table
+    fs = 17 - 1.5*len(case_dirs)
+    add_table_slide(prs, props_dict_list, keys, index_slide, title="Summary", fontsize=fs, short_names = short_names)
+
+
+def add_force_table_slide(prs, index_slide, case_dir="./", compare_case_dirs=[],
+                          frontal_area=None, forward_ave_start = None, short_names = None):
+    """Add table of force coefficients to its own slide."""
+    keylist = ["Case name", "Cd", "Cd err. (95% conf)", "Ref. Frontal area (m^2)",
+               "Cd * Af", "Cd porous", "Cl", "Cl err. (95% conf)", "Cl front",
+               "Cl rear", "Cs", "Cm pitch", "Cm yaw", "Cm roll", "Calc. Frontal area (m^2)"]
+    props_dict_list = []
+    case_dirs = [case_dir] + compare_case_dirs
+    for case in case_dirs:
+        d = summary(case_dir=case, frontal_area=frontal_area, forward_ave_start = forward_ave_start)
+        props_dict_list.append(d)
+    # Font size is proportional to number of cases in table
+    fs = 18 - 1.0*len(case_dirs)
+    add_table_slide(prs, props_dict_list, keylist, index_slide, title="Force coefficients",
+                    fontsize=fs, short_names = short_names)
+
+def add_quadrant_slide(prs, index_slide, case_dir="./", compare_case_dirs=[],
+                          frontal_area=None, short_names = None):
+    """Add table of force coefficients to its own slide."""
+    keylist = ["total", "upper", "lower", "front", "back", "upper.front", "lower.front", "upper.rear", "lower.rear"]
+    props_dict_list = []
+    case_dirs = [case_dir] + compare_case_dirs
+    for case in case_dirs:
+        qf = os.path.join(case, "results", "quadrant_forces.dat")
+        if(not os.path.exists(qf)):
+            continue
+        d = {}
+        with open(qf) as f:
+            for line in f:
+                if(line[0] == "#"):
+                    continue
+                line_ar = line.split()
+
+                d[line_ar[0]] = float(line_ar[1])
+        props_dict_list.append(d)
+    # Font size is proportional to number of cases in table
+    fs = 18 - 1.0*len(case_dirs)
+    add_table_slide(prs, props_dict_list, keylist, index_slide, title="Drag by Quadrants",
+                    fontsize=fs, short_names = short_names)
+
+def add_df_table_slide(prs, df, title="", fontsize=16):
+    """Add slide corresponding with a table from a DataFrame."""
+    title_only_slide_layout = prs.slide_layouts[5]
+    slide = prs.slides.add_slide(title_only_slide_layout)
+    shapes = slide.shapes
+    shapes.title.text = title
+    left = Inches(0.25)
+    top = Inches(top_clearance)
+    width = Inches(9.5)
+    height = Inches(0.5)
+    rows, cols = df.shape
+    table = shapes.add_table(rows + 1, cols + 1, left, top, width, height).table
+    # Set column width
+    # table.columns[0].width = Inches(2.5)
+    # Set index column name
+    table.cell(0, 0).text = str(df.index.name).title()
+    for col, (quantity, vals) in enumerate(df.items()):
+        table.cell(0, col + 1).text = str(quantity).title()
+        for row, val in enumerate(vals):
+            table.cell(row + 1, col + 1).text = str(val)
+            # Set index value multiple times; inefficient, but works
+            table.cell(row + 1, 0).text = str(df.index.values[row])
+    for icol in range(cols + 1):
+        for irow in range(rows + 1):
+            cell = table.rows[irow].cells[icol]
+            paragraph = cell.textframe.paragraphs[0]
+            paragraph.font.size = Pt(fontsize)
+
+
+
+def get_img_list(case_dir="./", img_dir_rel="images", compare_case_dirs=[],
+                 side_by_side=False, include_force_imgs=True,
+                 include_img_subdirs=False, only_images_kws=[],
+                 img_diffs=False, verbose=False, plot_list=["all-component-history", "cd-history", "cd-history-zoom",
+                 "cd-devel", "cl-history", "cl-history-zoom", "cl-devel", "cd-stabilization", "cl-stabilization"], animated_gifs=False,
+                 exclude_images_kws=[], light = False, include_delta_imgs = False):
+    """Get list of images to put into the PowerPoint."""
+    case_dir = os.path.abspath(case_dir)
+    cases = [case_dir]
+    exclude_images_kws.append('area-front-area')
+    exclude_images_kws.append('area-close-front')
+    # Sort MME images by the number in their file name
+    def sort_by_number(fpath):
+        fname = os.path.basename(fpath)
+        number = re.findall("-?\d+.?\d+?", fname)[0]
+        if "." in number:
+            number = float(number)
+        else:
+            if number.startswith("-"):
+                number = float(number[:2] + "." + number[2:])
+            else:
+                number = float(number[:1] + "." + number[1:])
+        return number
+    def sort_by_type_and_float(fpath):
+        fname = os.path.basename(fpath)
+        pattern = r"[+-]?\d*\.?\d+"
+        number = float(re.findall(pattern, fname)[0])
+        fname_no_numbers = re.sub(pattern, "", fname)
+        fname_no_numbers = re.sub(r"\d+", "", fname_no_numbers)
+        return fname_no_numbers, number
+    img_dir = os.path.join(case_dir, img_dir_rel)
+    force_img_dir = img_dir
+    if compare_case_dirs:
+        comp_img_dir = os.path.join(img_dir, "compare")
+        force_img_dir = comp_img_dir
+        cases = [case_dir] + compare_case_dirs
+        if side_by_side or img_diffs or animated_gifs:
+            cases = [case_dir]
+            img_dir_rel = "images/compare"
+            img_dir = comp_img_dir
+    force_imgs = [os.path.join(force_img_dir, p + ".png") for p in plot_list]
+    non_force_imgs = []
+    cases = [os.path.abspath(case) for case in cases]
+    for case in cases:
+        img_dir = os.path.join(case, img_dir_rel)
+        mesh_imgs = sorted(glob.glob(os.path.join(img_dir, "Mesh*.*")))
+        srf_imgs = sorted(glob.glob(os.path.join(img_dir, "SRF_*.*")))
+        geom_imgs = sorted(glob.glob(os.path.join(img_dir, "*_geometry_*.*")))
+        srf_imgs = [i for i in srf_imgs if i not in geom_imgs]
+        mme_imgs = sorted(glob.glob(os.path.join(img_dir, "MME_*.*")))
+        mme_clip_imgs = sorted(glob.glob(os.path.join(img_dir,
+                                                      "MME_*clip.*")))
+        # Remove clip images from MME images list
+        mme_imgs = [i for i in mme_imgs if i not in mme_clip_imgs]
+        mme_clip_types = get_mme_clip_types(mme_clip_imgs)
+        mme_clip_imgs = []
+        for clip_type in mme_clip_types:
+            mme_clip_imgs_i = sorted(glob.glob(os.path.join(img_dir,
+                                     "MME_" + clip_type + "_*clip*")),
+                                     key=sort_by_number)
+            # Filter list to only include those with a number directly after
+            # the clip type
+            mme_clip_imgs_i_filtered = []
+            for img in mme_clip_imgs_i:
+                p = img.split(clip_type)
+                try:
+                    number = float(p[-1].split("_")[1])
+                    mme_clip_imgs_i_filtered.append(img)
+                except ValueError:
+                    pass
+            mme_clip_imgs += mme_clip_imgs_i_filtered
+        non_force_imgs += mesh_imgs + geom_imgs + mme_clip_imgs + mme_imgs \
+               + srf_imgs
+    # Add images from subdirectories if selected
+    if include_img_subdirs:
+        for case in cases:
+            img_dir = os.path.join(case, img_dir_rel)
+            img_subdirs = [p for p in os.listdir(img_dir)
+                           if p not in ["compare", "logos"]]
+            img_subdirs = [os.path.join(img_dir, d) for d in img_subdirs]
+            img_subdirs = [d for d in img_subdirs if os.path.isdir(d)]
+            # Sort images a bit
+            geom_subdirs = [d for d in img_subdirs if "geometry" in d]
+            mesh_subdirs = [d for d in img_subdirs if "mesh" in d]
+            nearwall_subdirs = [d for d in img_subdirs if "near_wall" in d]
+            meanvel_subdirs = [d for d in img_subdirs if "mean_velocity" in d \
+                               and not "internal" in d]
+            internal_subdirs = [d for d in img_subdirs if "internal" in d]
+            other_subdirs = [d for d in img_subdirs if not d in geom_subdirs \
+                             and not d in mesh_subdirs \
+                             and not d in nearwall_subdirs \
+                             and not d in meanvel_subdirs \
+                             and not d in internal_subdirs]
+            img_subdirs = geom_subdirs + mesh_subdirs + meanvel_subdirs \
+                        + sorted(other_subdirs) + internal_subdirs \
+                        + nearwall_subdirs
+            for sd in img_subdirs:
+                for ext in ["*.png", "*.jpg", "*.gif"]:
+                    try:
+                        non_force_imgs += sorted(glob.glob(os.path.join(sd,
+                                                 ext)),
+                                                 key=sort_by_type_and_float)
+                    except IndexError:
+                        non_force_imgs += sorted(glob.glob(os.path.join(sd,
+                                                 ext)))
+    # Remove duplicates due to wildcard matching on similarly named mme imgs
+    imgs = non_force_imgs.copy()
+    non_force_imgs = []
+    for img in imgs:
+        if not img in non_force_imgs:
+            non_force_imgs.append(img)
+
+    # If comparing cases, only keep images with duplicates, and interleave them
+    if compare_case_dirs and not (side_by_side or img_diffs):
+        non_force_imgs_all = np.array(non_force_imgs)
+        img_names_all = [os.path.basename(img) for img in non_force_imgs_all]
+        img_names_all_rounded = img_names_all
+
+
+        for i, img_name in enumerate(img_names_all_rounded):
+            if('clip' in img_name):
+                float1 = re.search(r"[+-]? *(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", img_name) #porque
+                f1s, f1e = float1.start(), float1.end()
+                img_names_all_rounded[i] = img_name[:f1s] + str(round(float(img_name[f1s:f1e]),2)) + img_name[f1e:]
+
+        img_names_stripped = [i.replace(".png", "").replace(".jpg", "") for i in img_names_all_rounded]
+        non_force_imgs = []
+        img_names = []
+        for img_name in img_names_stripped:
+            if ((img_names_stripped.count(img_name) == len(cases))
+                     and not img_name in img_names):
+                 img_names.append(img_name)
+                 # Append first last instance of image name
+                 ind = np.where(np.array(img_names_stripped) == img_name)[0]
+                 if len(ind) == len(cases):
+                     non_force_imgs += list(non_force_imgs_all[ind])
+
+    if only_images_kws:
+        non_force_imgs_old = non_force_imgs.copy()
+        non_force_imgs = []
+        for img in non_force_imgs_old:
+            img_name = os.path.basename(img)
+            for kw in only_images_kws:
+                if kw.lower() in img_name.lower():
+                    non_force_imgs.append(img)
+    if exclude_images_kws:
+        non_force_imgs_old = non_force_imgs.copy()
+        non_force_imgs = []
+        for img in non_force_imgs_old:
+            img_name = os.path.basename(img)
+            kw_found = False
+            for kw in exclude_images_kws:
+                if kw.lower() in img_name.lower():
+                    kw_found = True
+            if not kw_found:
+                non_force_imgs.append(img)
+
+
+    contains_360 = any([i for i in non_force_imgs if "0-0" in i])
+    if(contains_360):
+        new_non_force_images = []
+        include_360_list = ["0-0", "0-3", "0-6", "2-2", "2-4", "3-3", "8-2", "8-4", "9-3"]
+        for i in non_force_imgs:
+            if i.split(".")[0].split("/")[-1] in include_360_list or "clip" in i:
+                new_non_force_images.append(i)
+        non_force_imgs = new_non_force_images
+
+
+    if(include_delta_imgs):
+        my_list = glob.glob(os.path.join(case_dir, "images/*delta*/*"))
+        for l in my_list:
+            non_force_imgs.append(l)
+
+    if(light):
+        exclude_list = ["mesh", "yplus", "internal", "detail", "x_", "mean_pressure_coefficient-clips", "-iso.", "fluctuation"]
+        light_img_list = []
+        for img in non_force_imgs:
+            append = True
+            for e in exclude_list:
+                if e in img.split("/")[-1]:
+                    append = False
+                    break
+            if(append): light_img_list.append(img)
+
+        non_force_imgs = light_img_list
+        force_imgs = [i for i in force_imgs if (not "zoom" in i) and (not "residuals" in i) and (not "stabilization" in i)]
+
+    if include_force_imgs:
+        return force_imgs + non_force_imgs
+    else:
+        return non_force_imgs
+
+
+def get_mme_clip_types(fpath_list):
+    """Return a list of MME clip image types."""
+    mme_clip_types = []
+    for img in fpath_list:
+        img = os.path.basename(img)
+        clip_type = "_".join(img.split("_")[1:-2])
+        if clip_type not in mme_clip_types:
+            mme_clip_types.append(clip_type)
+    return mme_clip_types
+
+
+def combine_images(img_fpath1, img_fpath2, savedir="images/compare"):
+    """Combine two images and put them in the `images/compare` directory.
+
+    Adapted from:
+    http://stackoverflow.com/questions/10657383/stitching-photos-together
+    """
+    if not os.path.isdir(savedir):
+        os.makedirs(savedir)
+    img_name = os.path.basename(img_fpath1)
+    image1 = Image.open(img_fpath1)
+    image2 = Image.open(img_fpath2)
+    width1, height1 = image1.size
+    width2, height2 = image2.size
+    result_width = width1 + width2
+    result_height = max(height1, height2)
+    result = Image.new("RGB", (result_width, result_height))
+    result.paste(im=image1, box=(0, 0))
+    result.paste(im=image2, box=(width1, 0))
+    result.save(os.path.join(savedir, img_name))
+
+
+def make_side_by_side_images(case_dir="./", compare_case_dirs=[],
+                             include_img_subdirs=True, verbose=False,
+                             only_images_kws=[], exclude_images_kws=[], light = False):
+    """For identically named images, create side-by-side versions."""
+    print("Creating side-by-side images")
+    img_list = get_img_list(case_dir=case_dir,
+                            compare_case_dirs=compare_case_dirs,
+                            include_force_imgs=False,
+                            include_img_subdirs=include_img_subdirs,
+                            only_images_kws=only_images_kws,
+                            exclude_images_kws=exclude_images_kws,
+                            light = light)
+    # Make a bunch of tuples out of the image pairs
+    img_list = [(img1, img2) for img1, img2 in zip(img_list[:-1:2],
+                                                   img_list[1::2])]
+    for pair in img_list:
+        if verbose:
+            print("Combining", pair[0], "and", pair[1])
+        img_subdir = os.path.basename(os.path.dirname(pair[0]))
+        if img_subdir == "images":
+            img_subdir = ""
+        combine_images(
+            *pair,
+            savedir=os.path.join(case_dir, "images", "compare", img_subdir)
+        )
+
+
+def make_animated_gifs(case_dir="./", compare_case_dirs=[],
+                       include_img_subdirs=True, verbose=False,
+                       only_images_kws=[], exclude_images_kws=[],
+                       light = False, gif_delay = 100, short_names = None):
+    """Create animated GIFs from identically named images in different cases."""
+    print("Creating animated GIFs")
+    img_list = get_img_list(case_dir=case_dir,
+                            compare_case_dirs=compare_case_dirs,
+                            include_force_imgs=False,
+                            include_img_subdirs=include_img_subdirs,
+                            only_images_kws=only_images_kws,
+                            exclude_images_kws=exclude_images_kws,
+                            light = light)
+    # Make a bunch of sublists from the image lists
+    cases = [case_dir] + compare_case_dirs
+    img_lists = []
+    for n, case in enumerate(cases):
+        img_lists.append(img_list[n::len(cases)])
+    # Loop through each individual image type
+    for n, img in enumerate(img_lists[0]):
+        filenames = [i[n] for i in img_lists]
+        if any("delta-surfaces" in f for f in filenames):
+            continue
+        if verbose:
+            print("Making animated GIF from", filenames)
+        img_name = os.path.splitext(os.path.basename(img))[0]
+        img_subdir = os.path.basename(os.path.dirname(filenames[0]))
+        if img_subdir == "images":
+            img_subdir = ""
+        fpath = os.path.join(case_dir, "images", "compare", img_subdir,
+                             img_name + ".gif")
+        dest_dir = os.path.dirname(fpath)
+        if not os.path.isdir(dest_dir):
+            os.makedirs(dest_dir)
+
+        cmd = "convert -delay {delay} -loop 0 {fpaths_in} {fpath_out}"
+        if(short_names is not None):
+            cmd = "convert -delay 100 -gravity SouthEast -pointsize 60 -fill Red -undercolor white %s" % " ".join(filenames)
+            for i,s in enumerate(short_names):
+                cmd += " \'(\' -clone %d -annotate +10+150 \'%s\' ')' " % (i, s)
+            cmd += "-delete 0-%d %s" % (len(short_names)-1, fpath)
+            call(cmd, shell = True)            
+        else :
+            call(cmd.format(delay = gif_delay, fpaths_in=" ".join(filenames), fpath_out=fpath),
+             shell=True)
+
+def make_diff_images(case_dir="./", compare_case_dirs=[],
+                     include_img_subdirs=True, verbose=False,
+                     only_images_kws=[], exclude_images_kws=[], light = False):
+    """For identically named images, create diff versions."""
+    print("Creating diff images")
+    img_list = get_img_list(case_dir=case_dir,
+                            compare_case_dirs=compare_case_dirs,
+                            include_force_imgs=False,
+                            include_img_subdirs=include_img_subdirs,
+                            only_images_kws=only_images_kws,
+                            exclude_images_kws=exclude_images_kws,
+                            light = light)
+    # Make a bunch of tuples out of the image pairs
+    img_list = [(img1, img2) for img1, img2 in zip(img_list[:-1:2],
+                                                   img_list[1::2])]
+    for (img1, img2) in img_list:
+        if verbose:
+            print("Diffing", img1, "and", img2)
+        img_name = os.path.basename(img1)
+        img_subdir = os.path.basename(os.path.dirname(img1))
+        if img_subdir == "images":
+            img_subdir = ""
+        savepath = os.path.join(case_dir, "images", "compare", img_subdir,
+                                img_name)
+        fordcfd.diff_images(img1, img2, savepath=savepath)
+
+
+def make_powerpoint(case_dir="./", case_name=None, case_type=None,
+                    compare_case_dirs=[], template=None, side_by_side=False,
+                    include_img_subdirs=True, only_images_kws=[],
+                    img_diffs=False, verbose=False, plot_list=["cd-history",
+                    "cd-devel", "cl-history", "cl-devel"],
+                    forward_average=True, backward_average=False,
+                    filter=False, forward_average_start_time=None,
+                    backward_average_end_time=None, frame1=None,
+                    animated_gifs=False, part_forces=False,
+                    surface_reports=False, exclude_images_kws=[],
+                    frontal_area=None, align_by = "axle", light = False,
+                    custom_wheel_names = None,
+                    gif_delay = 100, include_delta_imgs = False,
+                    short_names = None):
+    """Create a PowerPoint presentation from the input results."""
+    print("Creating PowerPoint presentation")
+    if(light):
+        plot_list = []
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_name is None:
+        case_name = detect_case_name(case_dir=case_dir)
+    if compare_case_dirs:
+        # Delete comparison images directory since these may be out of date
+        if(not light):
+            shutil.rmtree(os.path.join(case_dir, "images", "compare"),
+                      ignore_errors=True)
+        #Make comparison images
+        for plot in plot_list:
+            if "history" in plot:
+                fordcfd.plotting.plot_force_history(
+                    case_dir=case_dir,
+                    compare_case_dirs=compare_case_dirs,
+                    component=plot.split("-")[0],
+                    forward_average=forward_average,
+                    forward_average_start_time=forward_average_start_time,
+                    backward_average=backward_average,
+                    backward_average_end_time=backward_average_end_time,
+                    filter=filter,
+                    frame1=frame1
+                )
+            elif "devel" in plot:
+                fordcfd.plotting.plot_force_devel(
+                    case_dir=case_dir,
+                    compare_case_dirs=compare_case_dirs,
+                    component=plot.split("-")[0],
+                    align_by = align_by,
+                    custom_wheel_names = custom_wheel_names
+                )
+            elif "spectrum" in plot:
+                fordcfd.plotting.plot_force_spectral_density(
+                    component=plot.split("-")[0],
+                    compare_case_dirs=compare_case_dirs
+                )
+            elif ("stabilization" in plot):
+                fordcfd.plotting.plot_stabilization(case_dir = case_dir,
+                                                    case_type = case_type,
+                                                    component = plot.split("-")[0],
+                                                    t_ave_start = forward_average_start_time,
+                                                    compare_case_dirs = compare_case_dirs)
+        if side_by_side and not img_diffs and not animated_gifs:
+            make_side_by_side_images(case_dir=case_dir,
+                    compare_case_dirs=compare_case_dirs,
+                    include_img_subdirs=include_img_subdirs,
+                    verbose=verbose,
+                    only_images_kws=only_images_kws,
+                    exclude_images_kws=exclude_images_kws)
+        elif img_diffs:
+            make_diff_images(case_dir=case_dir,
+                             compare_case_dirs=compare_case_dirs,
+                             include_img_subdirs=include_img_subdirs,
+                             verbose=verbose,
+                             only_images_kws=only_images_kws,
+                             exclude_images_kws=exclude_images_kws)
+        elif animated_gifs and not light:
+            make_animated_gifs(case_dir=case_dir,
+                               compare_case_dirs=compare_case_dirs,
+                               include_img_subdirs=include_img_subdirs,
+                               verbose=verbose,
+                               only_images_kws=only_images_kws,
+                               exclude_images_kws=exclude_images_kws,
+                               gif_delay = gif_delay,
+                               short_names = short_names)
+    if template is None:
+        template_fpath = os.path.join(template_dir, "template.pptx")
+    else:
+        template_fpath = template
+    prs = Presentation(template_fpath)
+    add_title_slide(prs, case_name=case_name,
+                    compare_case_dirs=compare_case_dirs)
+
+    (index_table, irows, icols) = add_index_slide(prs)
+    index_slide = prs.slides[1]
+
+    add_summary_table_slide(prs, index_slide, case_dir=case_dir,
+                            compare_case_dirs=compare_case_dirs,
+                            frontal_area=frontal_area,
+                            forward_ave_start = forward_average_start_time,
+                            short_names = short_names)
+    add_force_table_slide(prs, index_slide, case_dir=case_dir,
+                          compare_case_dirs=compare_case_dirs,
+                          frontal_area=frontal_area,
+                          forward_ave_start = forward_average_start_time,
+                          short_names = short_names)
+    cases = [case_dir] + compare_case_dirs
+    quad_files_found = False
+    for c in cases:
+        quad_path = os.path.join(c, "results", "quadrant_forces.dat")
+        if(os.path.exists(quad_path)):
+            quad_files_found = True
+
+    if(quad_files_found and not light):
+        add_quadrant_slide(prs, index_slide, case_dir=case_dir,
+                          compare_case_dirs=compare_case_dirs,
+                          frontal_area=frontal_area,
+                          short_names = short_names)
+
+    if(case_type == "iconCFD" and not light):
+
+        cases = [c for c in cases if (fordcfd.detect_case_type(c).lower() == "iconcfd")]
+        table_dicts = []
+        for case in cases:
+            (velocity, Co, pressure) = fordcfd.icon.get_flow_minmax(case)
+            if(velocity == 0 and Co == 0 and pressure == 0):
+                continue
+            table_dict = {}
+            table_dict["velocity_max (m/s)"] = velocity['max']
+            format = lambda nlist : ([round(float(t),3) for t in nlist])
+            table_dict["velocity_max_loc"] = format(velocity['max_loc'])
+            table_dict["velocity_min (m/s)"] = velocity['min']
+            table_dict["velocity_min_loc"] = format(velocity['min_loc'])
+
+            table_dict["Pressure_max (Pa)"] = pressure['max']
+            table_dict["Pressure_max_loc"] = format(pressure['max_loc'])
+            table_dict["Pressure_min (Pa)"] = pressure['min']
+            table_dict["Pressure_min_loc"] = format(pressure['min_loc'])
+
+            table_dict["Courant_max"] = Co['max']
+            table_dict["Courant_max_loc"] = format(Co['max_loc'])
+            table_dict["Courant_min"] = Co['min']
+            table_dict["Courant_min_loc"] = format(Co['min_loc'])
+            table_dict = collections.OrderedDict(sorted(table_dict.items()))
+            table_dicts.append(table_dict)
+        if(table_dicts != []):
+            add_table_slide(prs, table_dicts, table_dicts[0].keys(), index_slide, title="Flow Field Max/Mins", fontsize=16, short_names = short_names)
+
+        table_dicts = []
+        for case in cases:
+            fluxes = fordcfd.icon.get_mass_fluxes(case)
+            table_dict = {}
+            for f in fluxes:
+                table_dict[f[0]] = f[1]
+            #from collections import OrderedDict
+            table_dict = collections.OrderedDict(sorted(table_dict.items()))
+            table_dicts.append(table_dict)
+        add_table_slide(prs, table_dicts, table_dicts[0].keys(), index_slide, title="Mass Fluxes", fontsize=16, short_names = short_names)
+
+        table_dicts = []
+        for case in cases:
+            (n_failed_checks, failed_checks) = icon.get_mesh_quality(case)
+            table_dict = {}
+            table_dict['Number Failed Mesh Checks'] = n_failed_checks
+            for (i,c) in enumerate(failed_checks):
+                table_dict['Mesh Err %d' % i] = c
+            table_dict = collections.OrderedDict(sorted(table_dict.items(), reverse = True))
+            table_dicts.append(table_dict)
+        max_len = -1
+        max_i = 0
+        for (i,t) in enumerate(table_dicts):
+            if(len(t) > max_len):
+                max_len = len(t)
+                max_i = i
+        add_table_slide(prs, table_dicts, table_dicts[max_i].keys(), index_slide, title="Meshing Errors", fontsize=16, short_names = short_names)
+
+    if part_forces:
+        for case in [case_dir] + compare_case_dirs:
+            if fordcfd.detect_case_type(case).lower() == "iconcfd":
+                d = fordcfd.icon.load_regional_forces(case_dir=case)
+                add_df_table_slide(prs, d, title="Forces per part")
+    if surface_reports:
+        for case in [case_dir] + compare_case_dirs:
+            if fordcfd.detect_case_type(case).lower() == "iconcfd":
+                d = fordcfd.icon.load_all_mean_surface_reports(case_dir=case)
+                if d is not None:
+                    d = d[["mass_flux", "volume_flux", "pmean", "umean"]]
+                    add_df_table_slide(prs, d, title="Surface fluxes")
+
+    prev_box_list = []
+    next_box_list = []
+    img_list = get_img_list(case_dir=case_dir,
+                            compare_case_dirs=compare_case_dirs,
+                            side_by_side=side_by_side,
+                            include_img_subdirs=include_img_subdirs,
+                            only_images_kws=only_images_kws,
+                            img_diffs=img_diffs,
+                            animated_gifs=animated_gifs,
+                            exclude_images_kws=exclude_images_kws,
+                            light = light,
+                            include_delta_imgs = include_delta_imgs)
+
+    short_dir_names = any([i for i in img_list if "cpt_iso" in i])
+    for img in img_list:
+        # Ensure image exists, since old cases may not have lift devel/history
+        if os.path.isfile(img):
+            if("area-close-front" in img): #this img is for area calcs
+                continue
+            title = os.path.basename(img).split(".")[0]
+            title_list = title.split("-")
+            title = title_list[0]
+
+            if(short_dir_names or len(title) ==  1):
+                title = img.split("/")[-2]
+                if(title in name_codex.keys()):
+                    title = name_codex[title]
+
+            try:
+                if("clip" in title_list[1] or "surface" in title_list[1] or "isosurface" in title_list[1]): title += " " + title_list[1]
+                if("internal" in title_list[1]): title += " " + title_list[1] + " " + title_list[2]
+            except:
+                pass
+            title = title.replace("_", " ").lower()
+            title = title.replace("near wall", "near-wall")
+            title = title.replace("yplus", "y\u207A")
+            #title = title.replace("isosurface", "")
+            title = title[0].upper() + title[1:]
+
+
+            (prev_rPr, next_rPr) = add_image_slide(prs, img, index_slide, title=title)
+            prev_box_list.append(prev_rPr)
+            next_box_list.append(next_rPr)
+        else:
+            warnings.warn(img + " does not exist and won't be added to slides")
+    if compare_case_dirs:
+        fname = case_name + "_comparison_" \
+              + datetime.datetime.now().strftime("%Y-%m-%d") + ".pptx"
+    else:
+        fname = case_name + "_" + datetime.datetime.now().strftime("%Y-%m-%d") \
+              + ".pptx"
+    if(light):
+        fname = "light_" + fname
+
+    #populate index slide
+    ir = 1
+    ic = 0
+    current_name = ""
+    section_inds = []
+    skip_titles = ["Title", "Index", "history", "development", "coefficients", "Meshing Errors", "Flow Field Max/Mins", "Residuals", "stabilization", "Fluxes", "Umax loc", "Quadrant"]
+    for (s_i, s) in enumerate(prs.slides):
+        if(ic >= icols):
+            break
+        if(any([(st in s.name) for st in skip_titles])): continue
+        if(current_name != s.name):
+             current_name = s.name
+             section_inds.append(s_i)
+             rId = index_slide.part.relate_to(s.part, RT.SLIDE)
+             index_table.cell(ir,ic).text_frame.add_paragraph()
+             r = index_table.cell(ir,ic).text_frame.paragraphs[0].add_run()
+             r.text = s.name
+             rPr = r._r.get_or_add_rPr()
+             hlinkClick = rPr.add_hlinkClick(rId)
+             hlinkClick.set('action', 'ppaction://hlinksldjump')
+
+             ir +=1
+             if(ir >= irows):
+                ir = 1
+                ic += 1
+
+    img_offset = len(prs.slides) - len(next_box_list)
+    img_i = 0
+    for (s_i, s) in enumerate(prs.slides):
+        if(s_i < img_offset): continue
+
+        img_i = s_i - img_offset
+
+        nsect_i = bisect.bisect_right(section_inds, s_i)
+        if(nsect_i < len(section_inds)):
+            next_index = section_inds[nsect_i]
+            next_box_list[img_i].textframe.add_paragraph()
+            next_r = next_box_list[img_i].textframe.paragraphs[0].add_run()
+            next_r.text = "Next"
+            rId = s.part.relate_to(prs.slides[next_index].part, RT.SLIDE)
+            rPr = next_r._r.get_or_add_rPr()
+            hlinkClick = rPr.add_hlinkClick(rId)
+            hlinkClick.set('action', 'ppaction://hlinksldjump')
+
+        prev_index = section_inds[bisect.bisect_left(section_inds, s_i)-1]
+        prev_box_list[img_i].textframe.add_paragraph()
+        prev_r = prev_box_list[img_i].textframe.paragraphs[0].add_run()
+        prev_r.text = "Prev"
+        rId = s.part.relate_to(prs.slides[prev_index].part, RT.SLIDE)
+        rPr = prev_r._r.get_or_add_rPr()
+        hlinkClick = rPr.add_hlinkClick(rId)
+        hlinkClick.set('action', 'ppaction://hlinksldjump')
+    prs.save(os.path.join(case_dir, fname))
+    print("Finished making powerpoint at %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
