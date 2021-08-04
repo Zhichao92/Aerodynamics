@@ -1,0 +1,708 @@
+"""iconCFD specific functions."""
+
+from __future__ import division, print_function, absolute_import
+import os
+import csv
+import numpy as np
+import glob
+import subprocess
+import warnings
+import pandas as pd
+import re
+import time
+import fordcfd
+import fordcfd.foam
+from fordcfd.foam import *
+from subprocess import check_output
+from sys import stdout
+import shutil
+import gzip
+
+
+def get_pid_max_min(case_dir="./", fpath_rel="system/iconHexMeshDict"):
+    geo_path = os.path.join(case_dir, fpath_rel)
+    try:
+        surf_text = []
+        import pyparsing
+        with open(geo_path) as f:
+            file_txt = f.readlines()
+            for i, line in enumerate(file_txt):
+                if(line.strip().startswith("name")):
+                    if(line.split()[1][0] == "G"):
+                        surf_text.append(line)
+                if("minStlBB" in line and len(surf_text) > 0):
+                    if(surf_text[-1].split()[0] == "name"):
+                        surf_text.append(line)
+                if("maxStlBB" in line and len(surf_text) > 0):
+                    if(surf_text[-1].split()[0] == "//minStlBB"):
+                        surf_text.append(line)
+
+        if(len(surf_text)%3 != 0):
+            print("error parsing iconHexMeshDict")
+            return([-1,-1,0],[1,1,1])
+
+        xmin_arr = []
+        xmax_arr = []
+        for line in surf_text:
+            if("minStlBB" in line):
+                line_ar = line.split()
+                xmin_arr.append([float(line_ar[-3]), float(line_ar[-2]), float(line_ar[-1])])
+            if("maxStlBB" in line):
+                line_ar = line.split()
+                xmax_arr.append([float(line_ar[-3]), float(line_ar[-2]), float(line_ar[-1])])
+        xmin_arr = np.array(xmin_arr)
+        xmax_arr = np.array(xmax_arr)
+
+        x_min = [np.min(xmin_arr[:,0]), np.min(xmin_arr[:,1]), np.min(xmin_arr[:,2])]
+        x_max = [np.max(xmax_arr[:,0]), np.max(xmax_arr[:,1]), np.max(xmax_arr[:,2])]
+        return (x_min, x_max)
+
+    except:
+        print("error parsing iconHexMeshDict")
+        return([-1,-1,0],[1,1,1])
+
+def get_axle_locs(case_dir="./", fpath_rel="system/controlDict"):
+    """Find axle locations in setupDataDict.
+    Values are returned in meters in the format ([fx,fy,fz], [rx,ry,rz])
+    """
+    referencePointTemplate = read_vehicle_position(case_dir)
+    front_axle = referencePointTemplate.copy()
+    rear_axle = referencePointTemplate.copy()
+
+    controlDictFile = os.path.join(case_dir, fpath_rel)
+    txt = fordcfd.grep("referenceLength", controlDictFile).replace(";", " ").split()
+    wheel_base = float(txt[1])
+    front_axle[0] -= 0.5*wheel_base
+    rear_axle[0]  += 0.5*wheel_base
+    return np.array([front_axle, rear_axle])
+
+def read_vehicle_position(case_dir="./", fpath_rel="system/controlDict"):
+    """Parse vehicle position from `controlDict`.
+
+    Returns a numpy array.
+    """
+    fpath = os.path.join(case_dir, fpath_rel)
+    kw = "referencePoint"
+    with open(fpath) as f:
+        for line in f.readlines():
+            line = line.strip()
+            if line.startswith(kw):
+                # Get rid of any comments
+                line = line.split("//")[0].strip()
+                line = line.replace(";", "").replace("(", "").replace(")", "")
+                line = line.split()
+                return np.array([float(num) for num in line[1:]])
+
+
+def get_residuals(case_dir="./", fpath_rel="log/050_iconPisoFoam_*.log"):
+    def starttime(s):
+        return float(s.split("_")[-1].replace(".log", ""))
+
+    fpath = os.path.join(case_dir, fpath_rel)
+    #use the most recent logfile in the log directory
+    fpaths = sorted(glob.glob(fpath), key=starttime)
+    if(len(fpaths) > 1):
+        print("Warning, multiple iconPisoFoam log files to choose from for \
+        residuals plot, choosing %s" % glob.glob(fpath)[-1])
+    fname = fpaths[-1]
+
+    time_arr = []
+    ux_ires = []
+    uy_ires = []
+    uz_ires = []
+    ux_fres = []
+    uy_fres = []
+    uz_fres = []
+    p_ires = []
+    p_fres = []
+    cont_loc = []
+    cont_glob =  []
+    cont_cum =  []
+    with open(fname) as f:
+        lines = f.readlines()
+        for (i, line) in enumerate(lines):
+            line = line.replace(",", " ")
+            if("Time = " in line and "Execution" not in line):
+            	line_arr = line.split()
+            	time_arr.append(float(line_arr[-1]))
+            if("Solving for Ux" in line):
+            	line_arr = line.split()
+            	ux_ires.append(float(line_arr[7]))
+            	ux_fres.append(float(line_arr[11]))
+            if("Solving for Uy" in line):
+            	line_arr = line.split()
+            	uy_ires.append(float(line_arr[7]))
+            	uy_fres.append(float(line_arr[11]))
+            if("Solving for Uz" in line):
+            	line_arr = line.split()
+            	uz_ires.append(float(line_arr[7]))
+            	uz_fres.append(float(line_arr[11]))
+            if("PISO: converged in" in line):
+                for j in range(1,20):
+                    bline = lines[i-j]
+                    bline = bline.replace(",", " ")
+                    if("GAMG" in bline):
+                        line_arr = bline.split()
+                        p_ires.append(float(line_arr[7]))
+                        p_fres.append(float(line_arr[11]))
+                        break
+                for j in range(1,20):
+                    bline = lines[i-j]
+                    bline = bline.replace(",", " ")
+                    if("time step continuity errors " in bline):
+                        line_arr = bline.split()
+                        cont_loc.append(float(line_arr[8]))
+                        break
+
+    min_len = min(len(time_arr), len(ux_ires), len(ux_fres), len(uy_ires),
+                  len(uy_fres), len(uz_ires), len(uz_fres), len(p_ires),
+                  len(p_fres), len(cont_loc))
+    err_arr = np.array((time_arr[:min_len], ux_ires[:min_len], ux_fres[:min_len],
+                        uy_ires[:min_len], uy_fres[:min_len], uz_ires[:min_len],
+                        uz_fres[:min_len], p_ires[:min_len], p_fres[:min_len],
+                        cont_loc[:min_len]))
+    return err_arr
+
+def set_field(str, dict, line):
+    line = line.replace('(', ' ')
+    line = line.replace(')', ' ')
+    line = line.replace(',', ' ')
+    line_arr = line.split()
+    if(str in line and len(dict) == 0):
+        dict['min'] = float(line_arr[2])
+        dict['min_loc'] = np.array(line_arr[4:7]).astype(np.float)
+        dict['max'] = float(line_arr[8])
+        dict['max_loc'] = np.array(line_arr[10:13]).astype(np.float)
+    return dict
+
+def get_flow_minmax(case_dir, fpath_rel="log/050_iconPisoFoam_*.log"):
+    fpath = os.path.join(case_dir, fpath_rel)
+    #use the most recent logfile in the log directory
+    if(len(glob.glob(fpath)) > 1):
+        print("Warning, multiple iconPisoFoam log files to choose from, choosing %s" % glob.glob(fpath))
+    try:
+        fname = glob.glob(fpath)[0]
+    except:
+        return (0,0,0)
+
+    velocity = {}
+    pressure = {}
+    Co = {}
+    with open(fname) as f:
+        lines = reversed(f.readlines())
+        for line in lines:
+            velocity = set_field("Unwv: min", velocity, line)
+            Co = set_field("Co: min", Co, line)
+            pressure = set_field("p: min", pressure, line)
+            if(len(velocity) > 0 and len(pressure) > 0 and len(Co) > 0): break
+    return (velocity, Co, pressure)
+
+def load_force_history(case_dir="./",
+                       fpath_rel="log/liftDrag_*_liftDrag-*.dat",
+                       append=True,
+                        **kwargs):
+    """Load force coefficient history from iconCFD run."""
+    def starttime(s):
+        return float(s.split("-")[-1].replace(".dat", ""))
+    fpath = os.path.join(case_dir, fpath_rel)
+    fpaths = sorted(glob.glob(fpath), key=starttime)
+    data = None
+    if not append:
+        fpaths = fpaths[-1]
+    for fpath in fpaths:
+        data_ind = np.loadtxt(fpath)
+        if data is None:
+            data = data_ind.copy()
+        else:
+            data = np.append(data, data_ind, axis=0)
+    return dict(time=data[:, 0], cl=data[:, 4], cd=data[:, 10], cs=data[:, 11],
+                cl_front=data[:, 5], cl_rear=data[:, 6], cl_porous=data[:, 3],
+                cd_porous=data[:, 9], cmx=data[:, 12], cmy=data[:, 13],
+                cmz=data[:, 14], n_steps = len(data[:,0]))
+
+
+def average_data(data, time_arr=None, t1=None, case_dir="./", end_time=None):
+    """Average a NumPy array (or ``DataFrame``)."""
+    if t1 is None:
+        t1 = get_averaging_start_time(case_dir=case_dir)
+    if time_arr is None:
+        time_arr = data["time"]
+    if time_arr.max() < t1:
+        warnings.warn("Array not long enough to compute desired average")
+        t1 = time_arr[len(time_arr)//2 - 1]
+    if end_time is None:
+        data = data[time_arr >= t1]
+    else:
+        data = data[(time_arr >= t1) & (time_arr <= end_time)]
+    mean_data = data.mean(axis=0)
+    try:
+        mean_data["cd_std_err"] = fordcfd.calc_confidence_interval(data.cd, i_samp = fordcfd.core.calc_indept_samples(data.cd))
+        mean_data["cl_std_err"] = fordcfd.calc_confidence_interval(data.cl, i_samp = fordcfd.core.calc_indept_samples(data.cl))
+    except AttributeError:
+        pass
+    return mean_data
+
+
+def load_mean_forces(case_dir="./", forward_ave_start = None, end_time=None):
+    """Load and calculate mean force coefficients.
+
+    Will return NaNs if force history is not long enough."""
+    d = load_force_history(case_dir=case_dir)
+    df = pd.DataFrame(d)
+    return average_data(df, t1 = forward_ave_start, case_dir=case_dir, end_time=end_time)
+
+
+def load_force_devel(case_dir="./", component="drag",
+                     fpath_rel_template="log/liftDrag_*_bin{}-*.dat",
+                     append=True, **kwargs):
+    """Load average force development data."""
+    def starttime(s):
+        return float(s.split("-")[-1].replace(".dat", ""))
+    fpath = fpath_rel_template.format(component.title())
+    fpath = os.path.join(case_dir, fpath)
+    data = None
+    fpaths = sorted(glob.glob(fpath), key=starttime)
+    if not append:
+        fpaths = fpaths[-1]
+    for fpath in fpaths:
+        data_ind = np.loadtxt(fpath)
+        if data is None:
+            data = data_ind.copy()
+        else:
+            data = np.append(data, data_ind, axis=0)
+    time = data[:, 0]
+    force = data[:, 1:]
+    with open(fpath) as f:
+        line = f.readline()
+    x = [float(i) for i in line.split()[2:]]
+    x = np.array(x)
+    df = pd.DataFrame()
+    df["force"] = average_data(force, time_arr=time, case_dir=case_dir)
+    df["x"] = x
+    return df
+
+
+def load_lift_drag_devel(case_dir="./", write_csv=True, **kwargs):    
+    """Load both lift, drag, and side force development."""
+    lift = load_force_devel(component="lift", case_dir=case_dir, **kwargs)
+    drag = load_force_devel(component="drag", case_dir=case_dir, **kwargs)
+    side = load_force_devel(component="Side", case_dir=case_dir, **kwargs)
+    df = pd.DataFrame()
+    df["x"] = lift["x"]
+    df["cl"] = lift["force"]
+    df["cd"] = drag["force"]
+    df["cs"] = side["force"]
+    if write_csv:
+        results_dir = os.path.join(case_dir, "results")
+        if not os.path.isdir(results_dir):
+            os.makedirs(results_dir)
+        fpath = os.path.join(results_dir, "force-devel.csv")
+        try:
+            df.to_csv(fpath, index=False)
+        except PermissionError:
+            pass
+    return df
+
+
+
+def get_pids(case_dir="./"):
+    parts = []
+    with open(os.path.join(case_dir, "system/controlDict")) as f:
+        save_parts = False
+        for line in f:
+            if(save_parts):
+                if(")" in line):
+                    break
+                parts.append(line.strip())
+            if("partialNamed" in line):
+                save_parts = True
+    #glob_template = os.path.join(case_dir, "log", "*regional*.dat")
+    #fpath = max(glob.glob(glob_template))
+    #with open(fpath) as f:
+    #    line = f.readline()
+    #parts = line.replace("#", "").strip().split()[1:]
+    return parts
+
+def load_regional_forces(case_dir="./", write_csv=True, verbose=False):
+    """Load averaged regional forces."""
+    glob_template = os.path.join(case_dir, "log", "*regional{comp}*.dat")
+    t1 = get_averaging_start_time(case_dir=case_dir)
+    df = pd.DataFrame()
+    for component, coeff in zip(["Lift", "Drag", "Side"], ["cl", "cd", "cs"]):
+        fpath = max(glob.glob(glob_template.format(comp=component)))
+        # Read part names first
+        with open(fpath) as f:
+            line = f.readline()
+        parts = line.replace("#", "").strip().split()[1:]
+        data = np.loadtxt(fpath)
+        time = data[:, 0]
+        data = data[time >= t1, 1:].mean(axis=0)
+        s = pd.Series()
+        for n, part in enumerate(parts):
+            s[part] = data[n]
+        df[coeff] = s
+    df.index.name = "part"
+    if write_csv:
+        savedir = os.path.join(case_dir, "results")
+        if not os.path.isdir(savedir):
+            os.makedirs(savedir)
+        fpath = os.path.join(savedir, "force-parts.csv")
+        try:
+            df.to_csv(fpath)
+        except PermissionError:
+            pass
+    if verbose:
+        print("Force coefficients per part:")
+        print(df)
+    return df
+
+
+def load_surface_report(fpath=None):
+    """Load an iconCFD surface report file and return as a ``DataFrame``.
+
+    Columns are assumed to be:
+    * Time
+    * volumeflux
+    * posvolumeflux
+    * negvolumeflux
+    * pmin
+    * pmax
+    * pmean
+    * pstDev
+    * Umin
+    * Umax
+    * Umean
+    * UstDev
+    """
+    data = np.loadtxt(fpath)
+    df = pd.DataFrame()
+    df["time"] = data[:, 0]
+    df["volume_flux"] = data[:, 1]
+    df["pos_volume_flux"] = data[:, 2]
+    df["neg_volume_flux"] = data[:, 3]
+    df["pmin"] = data[:, 4]
+    df["pmax"] = data[:, 5]
+    df["pmean"] = data[:, 6]
+    df["p_std"] = data[:, 7]
+    df["umin"] = data[:, 8]
+    df["umax"] = data[:, 9]
+    df["umean"] = data[:, 10]
+    df["u_std"] = data[:, 11]
+    return df
+
+
+def load_all_mean_surface_reports(case_dir="./", write_csv=True, verbose=False):
+    """Load all mean surface report data and return as a ``DataFrame``."""
+    df = pd.DataFrame()
+    rho = get_rho_inf(case_dir=case_dir)
+    fpath_glob = os.path.join(case_dir, "log", "surfaceReport*")
+    fpaths = sorted(glob.glob(fpath_glob))
+    if not fpaths:
+        return None
+    dfs = {}
+    for f in fpaths:
+        part = f.split("surfaceReport_")[-1].split("_surfaceStatistics")[0]
+        dfi = load_surface_report(f)
+        if not part in dfs.keys():
+            dfs[part] = dfi
+        else:
+            dfs[part] = dfs[part].append(dfi, ignore_index=True)
+    for part, dfi in dfs.items():
+        s = pd.Series()
+        s["part"] = part
+        s = s.append(average_data(dfi, case_dir=case_dir))
+        df = df.append(s, ignore_index=True)
+    df["mass_flux"] = rho*df.volume_flux
+    cols = df.columns.tolist()
+    cols.remove("part")
+    cols.remove("mass_flux")
+    cols.remove("time")
+    cols = ["part", "mass_flux"] + cols
+    df = df[cols]
+    df = df.set_index("part")
+    if write_csv:
+        fpath = os.path.join(case_dir, "results", "surface-reports.csv")
+        df.to_csv(fpath)
+    if verbose:
+        print(df)
+    return df
+
+
+def get_mesh_time(case_dir="./"):
+    """Read iconHexMesh log to determine total meshing time in seconds."""
+    return fordcfd.foam.get_mesh_time(case_dir=case_dir,
+                                      log_glob="log/*HexMesh*.log")
+
+
+def get_mesh_props(case_dir="./"):
+    """Grep iconHexMesh log to determine mesh properties."""
+    logpath = glob.glob(os.path.join(case_dir, "log", "*HexMesh*.log"))[0]
+    txt = fordcfd.grep("Final mesh", logpath).strip().replace(":", " ").split()
+    try:
+        return dict(Cells=int(txt[3]), Faces=int(txt[-3]), Points=int(txt[-1]))
+    except IndexError:
+        print("Cannot read iconCFD mesh properties")
+        return dict(Cells=np.nan, Faces=np.nan, Points=np.nan)
+
+def get_mesh_quality(case_dir="./"):
+    """Get mesh quality results from check mesh log """
+    logpath = glob.glob(os.path.join(case_dir, "log", "*checkMesh*.log"))[0]
+    check_mesh_txt = []
+    n_failed_checks = 0
+    start_geo_check = False
+    with open(logpath) as f:
+        for line in f:
+            if("Checking geometry..." in line):
+                start_geo_check = True
+            if(start_geo_check):
+                if("***" in line or "<<" in line):
+                    check_mesh_txt.append(line)
+                if("Failed" in line and "mesh" in line and "checks" in line):
+                    n_failed_checks = line.split()[1]
+    return (n_failed_checks, check_mesh_txt)
+
+
+def clean_icon_name(name_str):
+    name_str = name_str.replace("Case_SETUP_1_", "")
+    index = name_str.find("_sa-ddes-")
+    if(index != -1):
+        name_str = name_str[:index]
+    return name_str
+
+def get_solver_times(case_dir="./", log_glob="log/*icon*Foam*.log"):
+    """Read simulated time, execution time, and clock time from solver log."""
+    return fordcfd.foam.get_solver_times(case_dir=case_dir, log_glob=log_glob)
+
+def get_mass_fluxes(case_dir="./", log_glob="log/massFlux*", surf_glob = "log/surfaceReport*", forward_ave_start = 0.5, version = "3.4.13"):
+    mf_logs = glob.glob(os.path.join(case_dir, log_glob))
+    fluxes = []
+    for file in mf_logs:
+        data = np.genfromtxt(file, skip_header=1)
+        t_range = data[:,0] > forward_ave_start
+        fname = file.split("/")[-1].split("__")[0]
+        fname+=" (kg/s)"
+        fvalue = round(data[t_range,1].mean(),3)
+        fluxes.append((fname,fvalue))
+
+    surf_logs = glob.glob(os.path.join(case_dir, surf_glob))
+    vflux_col = -4
+    if("3.2" in version):
+        vflux_col = -2
+    for file in surf_logs:
+        data = np.genfromtxt(file, skip_header=1)
+        t_range = data[:,0] > forward_ave_start
+        s_ind = file.index("SREP")
+        fname = file[s_ind:].split("__")[0]
+        fname+=" (kg/s)"
+        rho = float(read_single_line_value("rho", os.path.join(case_dir, "constant/transportProperties"), index = -1))
+        fvalue = round(rho*data[t_range,vflux_col].mean(),3)
+        fluxes.append((fname,fvalue))
+    return fluxes
+
+def summary(case_dir="./", forward_ave_start = None):
+    """Get iconCFD case summary and return as dictionary."""
+
+    d = {}
+    if(forward_ave_start == None):
+        forward_ave_start = get_averaging_start_time(case_dir)
+        d["Averaging Start (s)"] = forward_ave_start
+    d["Meshing time (hr)"] = np.round(get_mesh_time(case_dir=case_dir)/3600,
+                                      decimals=1)
+    d["Case name"] = fordcfd.detect_case_name(case_dir=case_dir)
+    d["Case type"] = "iconCFD"
+    d["Turbulence model"] = get_turbulence_model(case_dir=case_dir)
+    try:
+        d["VPMS_fluxs"] = get_mass_fluxes(case_dir, forward_ave_start = forward_ave_start, version = get_version(case_dir=case_dir))
+    except:
+        print("No Mass fluxes found")
+        d["VPMS_fluxs"] = []
+    d.update(get_mesh_props(case_dir=case_dir))
+    try:
+        d.update(get_solver_times(case_dir=case_dir))
+    except:
+        d["Clock time (hr)"] = 0.0
+        print("Could not find solver times")
+        pass
+    try:
+        mean_forces = load_mean_forces(case_dir=case_dir, forward_ave_start = forward_ave_start).round(decimals=4)
+    except:
+        mean_forces = pd.DataFrame(dict(time=0.0, cl=0.0, cd=0.0, cd_std_err = 0.0, cl_std_err = 0.0, cs=0.0,
+                 cl_front=0.0, cl_rear=0.0, cl_porous=0.0, cd_porous=0.0, cmx=0.0, cmy=0.0,
+                 cmz=0.0, n_steps=0), index = [0])
+
+    d["Mean Cd"] = mean_forces.cd
+    d["Cd err. (95% conf)"] = mean_forces.cd_std_err
+    d["Mean Cl"] = mean_forces.cl
+    d["Cl err. (95% conf)"] = mean_forces.cl_std_err
+    d["Working directory"] = os.path.abspath(case_dir)
+    d["CPUs"] = get_number_of_cpus(case_dir=case_dir)
+    d["CPU hours"] = np.round(d["CPUs"] * d["Clock time (hr)"], decimals=1)
+    d["Cl"] = d["Mean Cl"]
+    d["Cd"] = d["Mean Cd"]
+    d["Cl front"] = mean_forces.cl_front
+    d["Cl rear"] = mean_forces.cl_rear
+    d["Cs"] = mean_forces.cs
+    d["Cm pitch"] = mean_forces.cmy
+    d["Cm yaw"] = mean_forces.cmz
+    d["Cm roll"] = mean_forces.cmx
+    d["Time steps"] = int(mean_forces.n_steps)
+    d["Velocity (m/s)"] = get_free_stream_velocity(case_dir=case_dir)[0]
+    d["Ref. Frontal area (m^2)"] = get_ref_area(case_dir=case_dir)
+    d["Cd * Af"] = np.round(float(d["Cd"])* d["Ref. Frontal area (m^2)"], decimals=4)
+    d["Cd porous"] = mean_forces.cd_porous
+    (d["Number Failed Mesh Checks"], d["Failed Mesh Checks"]) = get_mesh_quality(case_dir)
+    if steady_case(case_dir=case_dir):
+        d["Steady/unsteady"] = "steady"
+        d["Simulated time (s)"] = "N/A"
+    else:
+        d["Steady/unsteady"] = "unsteady"
+    ref_info = get_refinement_info(case_dir=case_dir)
+    d["Max refinement"] = ref_info.refinement_level.iloc[-1]
+    d["Max refinement cells"] = ref_info.n_cells.iloc[-1]
+    d["Solver version"] = get_version(case_dir=case_dir)
+    return d
+
+
+def get_translation_vector(case_dir="./"):
+    """Get translation vector for the EnSight input config files."""
+    # Insert translation vector
+    vec = read_vehicle_position()
+    # Icon recommended translations to ref point
+    vec *= np.array((-1, -1, -1))
+    return vec
+
+
+def get_free_stream_velocity(case_dir="./",
+                             dictpath_rel="system/controlDict"):
+    """Read free stream velocity and return as 3-component NumPy array."""
+    fpath = os.path.join(case_dir, dictpath_rel)
+    with open(fpath) as f:
+        found_u = False
+        for line in f.readlines():
+            line = line.strip()
+            if line:
+                if line.split()[0] == "Uinf":
+                    line = re.split("\(|\)", line)
+                    vals = [float(v) for v in line[-2].split()]
+                    return np.array(vals)
+
+
+def get_ref_area(case_dir="./", dictpath_rel="system/controlDict"):
+    """Read `referenceArea` from iconCFD run."""
+    fpath = os.path.join(case_dir, dictpath_rel)
+    return read_single_line_value("referenceArea", fpath, dtype=float)
+
+
+def get_rho_inf(case_dir="./", dictpath_rel="system/controlDict"):
+    """Read ``rhoInf`` from iconCFD case."""
+    fpath = os.path.join(case_dir, dictpath_rel)
+    return read_single_line_value("rhoInf", fpath, dtype=float)
+
+
+def get_version(case_dir="./"):
+    """Parse the version number from the solver log."""
+    return fordcfd.foam.get_version(case_dir=case_dir, log_glob="log/*Mesh*.log")
+
+
+def get_refinement_info(case_dir="./"):
+    """Look for refinement info in snappy log."""
+    return fordcfd.foam.get_refinement_info(case_dir=case_dir,
+                                            log_glob="log/*HexMesh*.log")
+
+
+def get_averaging_start_time(case_dir="./"):
+    """Lookup when field averaging starts."""
+    fpath = os.path.join(case_dir, "system", "controlDict")
+    return read_single_line_value("startTMeanVars", fpath, dtype=float)
+
+
+def get_current_solver_time(case_dir="./", log_glob="log/*Foam*.log",
+                            n_tail_lines=200):
+    """Get current solver time in seconds."""
+    return fordcfd.foam.get_current_solver_time(case_dir=case_dir,
+                                                log_glob=log_glob,
+                                                n_tail_lines=n_tail_lines)
+
+
+def get_current_clocktime(case_dir="./", log_glob="log/*Foam*.log",
+                          n_tail_lines=200):
+    """Return clockTime in seconds."""
+    return fordcfd.foam.get_current_clocktime(case_dir=case_dir,
+                                              log_glob=log_glob,
+                                              n_tail_lines=n_tail_lines)
+
+
+def print_status(case_dir="./"):
+    """Print percent complete, CPU hrs/s, and current mean Cd."""
+    return fordcfd.foam.print_status(case_dir=case_dir, module=fordcfd.icon)
+
+
+def monitor(case_dir="./", autostop=False, cd_threshold=0.002,
+            cl_threshold=0.004):
+    """Continuously monitor an OpenFOAM case."""
+    fordcfd.foam.monitor(case_dir=case_dir, autostop=autostop,
+                         cd_threshold=cd_threshold,
+                         cl_threshold=cl_threshold, module=fordcfd.icon)
+
+
+def run_apps(case_dir="./", apps=["vorticity"]):
+    """Run iconCFD apps (in parallel) on current case."""
+    if isinstance(apps, str):
+        apps = [apps]
+    print("Running iconCFD apps:", ", ".join(apps))
+    case_dir = os.path.abspath(case_dir)
+    nproc = get_number_of_cpus(case_dir=case_dir)
+    # Rename commands.info file if it exists
+    commands_fpath = os.path.join(case_dir, "commands.info")
+    if os.path.isfile(commands_fpath):
+        os.rename(commands_fpath, commands_fpath.replace("commands.info",
+                                                         "commands.info.org"))
+    commands_txt = "cd " + case_dir + "\n"
+    for app in apps:
+        commands_txt += ("mpirun -np $NCPUsSolver $MPIOptions {app} -parallel "
+                         "-latestTime > logs/{app}.log 2>&1\n".format(app=app))
+    with open(commands_fpath, "w") as f:
+        f.write(commands_txt)
+    cmd = "runiconcfd -V 3.0.17 -N {} -c commands.info -post off".format(nproc)
+    fordcfd.submit_batch_job_and_wait(cmd)
+    # Delete commands.info file
+    os.remove(commands_fpath)
+
+
+def vorticity(case_dir="./"):
+    """Run `vorticity` at latest time."""
+    run_apps(case_dir=case_dir, apps=["vorticity"])
+
+
+def sample(case_dir="./", auto_vorticity=True):
+    """Run `sample` at latest time; run `vorticity` if necessary."""
+    apps = []
+    proc_dir = os.path.join(case_dir, "processor0")
+    if auto_vorticity and not "vorticity.gz" in list(os.walk(proc_dir)):
+        apps.append("vorticity")
+    apps.append("sample")
+    # Copy sampleDict from template directory
+    sd_path = os.path.join(case_dir, "system", "sampleDict")
+    if os.path.isfile(sd_path):
+        os.rename(sd_path, sd_path.replace("sampleDict", "sampleDict.org"))
+    template = os.path.join(fordcfd.template_dir, "sampleDict")
+    shutil.copy(template, sd_path)
+    run_apps(case_dir=case_dir, apps=apps)
+    os.remove(sd_path)
+
+
+def stop_run(case_dir="./", log_glob="log/*icon*Foam*.log"):
+    """Stop an iconCFD solver."""
+    fordcfd.foam.stop_run(case_dir=case_dir, log_glob=log_glob)
+
+
+def run_foam_to_ensight():
+    """Create a commands.info file and submit a job to run ``foamToEnsight``."""
+    if os.path.isfile("commands.info"):
+        shutil.copy("commands.info", "commands.info-orig")
+    txt = ("mpirun -np $NCPUsSolver $MPIOptions foamToEnsight -parallel "
+           "-latestTime 2>&1 | tee log/070_foamToEnsight-fordcfd-post.log\n")
+    with open("commands.info", "w") as f:
+        f.write(txt)
+    subprocess.call("runiconcfd -V 3.0.17 -c commands.info -post off "
+                    "-P core -J convert-to-ensight", shell=True)
