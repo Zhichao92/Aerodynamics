@@ -1,0 +1,990 @@
+"""Common functions."""
+
+from __future__ import division, print_function, absolute_import
+import subprocess
+from subprocess import call, check_output
+import os
+import glob
+import sys
+import shutil
+import numpy as np
+import pandas as pd
+import tarfile
+import re
+import json
+import time
+import scipy.signal
+# noinspection PyUnresolvedReferences
+import imgdiff
+import fordcfd
+import datetime
+from imageio import imread
+
+# Make pandas print full values for long strings
+pd.set_option("display.max_colwidth", -1)
+
+
+
+#copy arc
+def copy_after(copy_path, case_dir, min_html, archive, ppt, restart):
+    replace_dir = {}
+    replace_dir["geometry"] = "geom"
+    replace_dir["mean_near_wall_velocity-surfaces"] = "unwv_surf"
+    replace_dir["mean_pressure_coefficient-clips"] = "p_clip"
+    replace_dir["mean_pressure_coefficient-internal-clips"] = "pi_clip"
+    replace_dir["mean_pressure_coefficient-surfaces"] = "p_surf"
+    replace_dir["mean_q-isosurfaces"] = "q_iso"
+    replace_dir["mean_total_pressure_coefficient-isosurfaces"] = "cpt_iso"
+    replace_dir["mean_velocity-clips"] = "u_clip"
+    replace_dir["mean_velocity-internal-clips"] = "ui_clip"
+    replace_dir["mean_yplus-surfaces"] = "yp_surf"
+    replace_dir["mesh-clips"] = "mesh_clip"
+    replace_dir["pressure_fluctuation_coeff-surfaces"] = "pf_surf"
+    replace_dir["mean_drag_force-surfaces"] = "md_surf"
+
+    img_keys = ["mean_near_wall_velocity_surface",
+                "mean_total_pressure_coefficient_isosurface",
+                "mean_velocity-internal-clip",
+                "mean_q_isosurface",
+                "mean_yplus-surface",
+                "mean_velocity-clip",
+                "mean_pressure_coefficient-clip",
+                "mean_pressure_coefficient-internal-clip",
+                "mesh-clip",
+                "mean_pressure_coefficient-surface",
+                "mean_near_wall_velocity-surface",
+                "geometry"]
+    short_name = fordcfd.icon.clean_icon_name(detect_case_name())
+    min_html_path = os.path.join(case_dir, short_name)
+
+    subprocess.call("cp %s %s" % (os.path.join(scripts_dir, "execPrePost.sh"), case_dir), shell=True)
+    command = "%s/execPrePost.sh %s" % (case_dir, "'mkdir -p %s'" % copy_path)
+    subprocess.call(command, shell=True)
+
+    if (restart == True):
+        command = "mkdir -p %s" %  os.path.join(copy_path, short_name, "restart")
+        subprocess.call(command, shell=True)
+        command = "cp -r %s %s" % (os.path.join(case_dir, "../input"), os.path.join(copy_path, short_name, "restart"))
+        subprocess.call(command, shell=True)
+        command = "cp %s %s" % (os.path.join(case_dir, "../dataDict"), os.path.join(copy_path, short_name, "restart"))
+        subprocess.call(command, shell=True)
+
+    if(min_html == True):
+        if(os.path.exists(min_html_path)):
+            shutil.rmtree(min_html_path)
+        os.mkdir(min_html_path)
+
+        subprocess.call("cp -r %s %s" % (os.path.join(case_dir,"images"), min_html_path), shell = True)
+        subprocess.call("cp -r %s %s" % (os.path.join(case_dir,"results"), min_html_path), shell = True)
+        subprocess.call("cp -r %s %s" % (os.path.join(case_dir,"system"), min_html_path), shell = True)
+        subprocess.call("cp %s %s" % (os.path.join(case_dir,"summary.csv"), min_html_path), shell = True)
+
+        for d in os.listdir(os.path.join(min_html_path, "images")):
+            if(os.path.isdir(os.path.join(min_html_path, "images", d))):
+                if(d in replace_dir.keys()):
+                    new_d = replace_dir[d]
+                    shutil.move(os.path.join(min_html_path, "images", d), os.path.join(min_html_path, "images", new_d))
+                    for img in os.listdir(os.path.join(min_html_path, "images", new_d)):
+                        for k in img_keys:
+                            if(k in img):
+                                new_img = img.replace(k, "")[1:]
+                                shutil.move(os.path.join(min_html_path, "images", new_d, img), os.path.join(min_html_path, "images", new_d, new_img))
+                                break
+
+        command = "%s/execPrePost.sh %s" % (case_dir, "'cp -r %s %s'" % (os.path.join(case_dir, min_html_path), copy_path))
+        subprocess.call(command, shell = True)
+        shutil.rmtree(min_html_path)
+    if(archive == True):
+        command = "%s/execPrePost.sh %s" % (case_dir, "'cp *.tar.gz %s'" % (os.path.join(copy_path, min_html_path)))
+        subprocess.call(command, shell = True)
+
+    if(ppt == True):
+        command = "%s/execPrePost.sh %s" % (case_dir, "'mkdir -p %s'" % (os.path.join(copy_path, min_html_path)))
+        subprocess.call(command, shell=True)
+        command = "%s/execPrePost.sh %s" % (case_dir, "'cp *.pptx %s'" % (os.path.join(copy_path, min_html_path)))
+        subprocess.call(command, shell=True)
+
+
+def resource_path(relative_path):
+    """Get absolute path to resource for both dev and PyInstaller executable.
+
+    See "http://stackoverflow.com/questions/7674790/bundling-data-files-with-\
+    pyinstaller-onefile"
+    """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(top_dir)
+    return os.path.join(base_path, relative_path)
+
+
+# Define some paths
+# Determine if application is a script file or frozen exe
+frozen = getattr(sys, "frozen", False)
+if frozen:
+    this_dir = os.path.dirname(sys.executable)
+    # Top dir is where run script lives
+    top_dir = this_dir
+else:
+    this_dir = os.path.dirname(__file__)
+    # Top dir is where run.py lives, not the case dir
+    top_dir = os.path.split(this_dir)[0]
+# Define template and scripts directories
+template_dir = resource_path("template")
+scripts_dir = resource_path("scripts")
+
+
+def detect_case_name(case_dir="./", case_type=None):
+    """Detect case name.
+
+    For PowerFLOW cases, the cdi file is used.
+    """
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_type.lower() == "powerflow":
+        cdi_files = glob.glob(os.path.join(case_dir, "*.cdi"))
+        if len(cdi_files) == 1:
+            return os.path.split(cdi_files[0])[1].replace(".cdi", "")
+        elif len(cdi_files) > 1:
+            raise ValueError("Two CDI files detected; remove one or specify "
+                             "case name")
+        elif not cdi_files:
+            return case_dir.split('/')[-1]
+            #raise FileNotFoundError("Cannot find CDI file to detect case name")
+    elif case_type.lower() == "iconcfd":
+        dirname = os.path.basename(os.path.abspath(case_dir))
+        # Case directory is name of current directory
+        if dirname.startswith("1_fine"):
+            # If transient, use dirname above for case name
+            case_dir = os.path.abspath(case_dir)
+            return os.path.basename(os.path.split(case_dir)[0])
+        else:
+            return dirname
+    elif case_type.lower() == "openfoam":
+        return os.path.basename(os.path.abspath(case_dir))
+    elif "ccm" in case_type.lower():
+        return fordcfd.ccm.detect_case_name(case_dir)
+
+
+def check_logs_dir(case_dir="./", dir_name="logs"):
+    """Check for logs directory and create if necessary."""
+    fpath = os.path.join(case_dir, dir_name)
+    if not os.path.isdir(fpath):
+        os.makedirs(fpath)
+
+
+def detect_case_type(case_dir="./"):
+    """Attempt to determine if this is an OpenFOAM, PowerFLOW, or CCM case.
+
+    OpenFOAM cases are detected from the presence of ``constant`` and ``system``
+    directories. iconCFD cases, which are a subset of an OpenFOAM cases, are
+    identified by the presence of a ``commands.info`` file. PowerFLOW cases are
+    detected from the presence of any ``*.cdi`` files in the case directory.
+    """
+    case_dir = os.path.abspath(case_dir)
+    case_contents = os.listdir(case_dir)
+    up_dir = os.path.split(case_dir)[0]
+    up_contents = os.listdir(up_dir)
+    if "constant" in case_contents and "system" in case_contents:
+        if "commands.info" in up_contents or "commands.info" in case_contents:
+            return "iconCFD"
+        else:
+            return "OpenFOAM"
+    elif glob.glob(os.path.join(case_dir, "*.cdi")) or 'pflow-cdi-summary.log' in os.listdir(os.path.join(case_dir,"logs")):
+        return "PowerFLOW"
+    elif glob.glob(os.path.join(case_dir, "VSimSettings*.xls*")):
+        return "Star-CCM+"
+    else:
+        raise ValueError("Cannot detect case type")
+
+
+def detect_program_name(case_dir="./", case_name=None):
+    """Attempt to detect program name from case_name."""
+    if case_name is None:
+        case_name = detect_case_name(case_dir=case_dir)
+    re_results = re.findall("[a-zA-Z]+\d\d\d", case_name)
+    if re_results:
+        return re_results[0].upper()
+
+
+def detect_vehicle_type(case_dir="./", case_name=None, program_name=None):
+    """Detect vehicle type based on either case name or program name."""
+    ids = {"CD": "sedan", "P": "pickup", "U": "SUV"}
+    if program_name is not None:
+        program_name = program_name.upper()
+    else:
+        # Try to detect program name from case name
+        program_name = detect_program_name(case_dir=case_dir,
+                                           case_name=case_name)
+        if program_name is None:
+            return None
+    for k, v  in ids.items():
+        if program_name.startswith(k):
+            return v
+
+
+def setup_template(overwrite=True, **kwargs):
+    """Setup template directories for EnSight post-processing script."""
+    print("Setting up template")
+    # Make images dir if it doesn't exist
+    if not os.path.isdir("images"):
+        os.mkdir("images")
+    # Make results dir if it doesn't exist
+    if not os.path.isdir("results"):
+        os.mkdir("results")
+    fordcfd.ensight.setup_template(overwrite=overwrite, **kwargs)
+
+
+def gen_summary(case_type=None, tee=False, overwrite=True, **kwargs):
+    """Generate case result summary if applicable."""
+    if case_type is None:
+        case_type = detect_case_type()
+    if case_type.lower() == "powerflow":
+        fordcfd.pflow.gen_summary_files(tee=tee, overwrite=overwrite, **kwargs)
+    else:
+        pass
+
+
+def clean(case_dir="./"):
+    """Remove all template files, images, etc."""
+    print("Cleaning post-processing files")
+    call(
+        (
+            "cd {} && rm -rf logs ensight-config images videos results envision_images"
+        ).format(case_dir), shell=True
+    )
+    for f in ["Fluid_Meas_Ave.pnc", "Fluid_Meas_Ave.snc", "Fluid_Meas_Ave.fnc"]:
+        f = os.path.join(case_dir, f)
+        if os.path.isfile(f):
+            os.remove(f)
+
+
+def log_cmd(logpath, tee=False):
+    """Return log command to add to string."""
+    if tee:
+        return " 2>&1 | tee " + logpath
+    else:
+        return " > " + logpath + " 2>&1"
+
+
+def grep(search_string, fpath, args=[], usegrep=False):
+    """grep-like command.
+
+    Parameters
+    ----------
+    search_string : str
+        String to search for.
+    fpath : str
+        File path to search.
+    usegrep : bool
+        Switch to use system `grep` command or manually iterate through file.
+    """
+    if usegrep:
+        if(len(args) == 0):
+            p = subprocess.Popen(["grep", search_string, fpath],
+                                 stdout=subprocess.PIPE)
+        else:
+            p = subprocess.Popen(["grep", search_string, fpath, str(*args)],
+                                 stdout=subprocess.PIPE)
+        out, err = p.communicate()
+        return out.decode()
+    else:
+        txt = ""
+        with open(fpath) as f:
+            for line in f.readlines():
+                if search_string in line:
+                    txt += line
+        return txt
+
+
+def read_single_line_value(keyword, fpath, dtype=str, occurrence=1,
+                           index=-1, remove=[]):
+    """Fine a line that starts with `keyword` and return the last word as
+    `dtype`.
+    """
+    occ = 0
+    with open(fpath) as f:
+        for line in f.readlines():
+            line = line.strip()
+            if line.startswith(keyword):
+                occ += 1
+                if occ == occurrence:
+                    string = line.split()[index]
+                    for c in remove:
+                        string = string.replace(c, "")
+                    return dtype(string)
+
+
+def archive(case_name=None, archive_paths=["images", "results", "logs", "log",
+            "summary.csv", "system", "constant/RASProperties", "simulator.o",
+            "constant/LESProperties", "constant/turbulenceProperties", "constant/transportProperties",
+            "summary.html", "commands.info", "../commands.info", "../dataDict"]):
+    """Compress post-processing results."""
+    print("Started archving at %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%m"))
+    if case_name is None:
+        case_name = detect_case_name()
+    case_name = case_name.replace("Case_SETUP_1_", "")
+    with tarfile.open(case_name + ".tar.gz", "w:gz") as tf:
+        for d in archive_paths:
+            if os.path.isfile(d) or os.path.isdir(d):
+                print("Adding", d, "to archive")
+                if d.startswith("../"):
+                    an = os.path.join(case_name, d.replace("../", ""))
+                else:
+                    an = os.path.join(case_name, d)
+                tf.add(d, arcname=an)
+        input_files = os.listdir("../input")
+        all_obj = all('.obj.gz' in f for f in input_files)
+        if(all_obj):
+            for d in input_files:
+                tf.add(os.path.join("../input", d), arcname=os.path.join(case_name, "input", d))
+        htmls = glob.glob("*.html")
+        for h in htmls:
+            tf.add(h,os.path.join(case_name, h))
+    print("Finished archving at %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+
+def check_overwrite(overwrite=True, proc_name="", outputs=[], exit=False,
+                    verbose=False):
+    """Check if files or directories in `outputs` exist, and delete or exit
+    according to `overwrite`.
+    """
+    okay_to_run = True
+    if proc_name:
+        proc_name += ": "
+    for path in outputs:
+        isfile = os.path.isfile(path)
+        isdir = os.path.isdir(path)
+        if isfile or isdir:
+            if overwrite and isfile:
+                if verbose:
+                    print(proc_name + "Deleting", path)
+                os.remove(path)
+            elif overwrite and isdir:
+                if verbose:
+                    print(proc_name + "Deleting", path)
+                shutil.rmtree(path)
+            else:
+                msg = (proc_name + path
+                       + " exists; remove or use --overwrite option")
+                if exit:
+                    sys.exit(msg)
+                else:
+                    print(msg)
+                    okay_to_run = False
+    return okay_to_run
+
+
+def detect_header_length(fpath, delimiter=None, comment_char="#"):
+    """Automatically determine header length from a text file containing
+    numerical data.
+    """
+    with open(fpath) as f:
+        for i, line in enumerate(f.readlines()):
+            line = line.strip()
+            if not line.startswith(comment_char):
+                line = line.split(delimiter)
+                try:
+                    val = float(line[0])
+                    return i
+                except (ValueError, IndexError):
+                    # Value is not a number or line is empty
+                    pass
+
+
+def load_force_history(case_dir=None, case_type=None, **kwargs):
+    """Load force history."""
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_type.lower() == "powerflow":
+        data = fordcfd.pflow.load_force_history(case_dir=case_dir, **kwargs)
+        data["cd"] = data["fx"]
+        data["cl"] = data["fz"]
+        data["cs"] = data["fy"]
+    elif case_type.lower() == "iconcfd":
+        data = fordcfd.icon.load_force_history(case_dir=case_dir, **kwargs)
+    elif case_type.lower() == "openfoam":
+        data = fordcfd.foam.load_force_history(case_dir=case_dir, **kwargs)
+    return data
+
+
+def load_force_devel(case_dir=None, case_type=None, **kwargs):
+    """Load force development."""
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_type.lower() == "powerflow":
+        data = fordcfd.pflow.load_force_devel(case_dir=case_dir, **kwargs)
+        data["cd"] = data["fx"]
+        data["cl"] = data["fz"]
+        data["cs"] = data["fy"]
+    elif case_type.lower() == "iconcfd":
+        data = fordcfd.icon.load_lift_drag_devel(case_dir=case_dir, **kwargs)
+    elif case_type.lower() == "openfoam":
+        data = fordcfd.foam.load_lift_drag_devel(case_dir=case_dir, **kwargs)
+    x_norm = data["x"].copy()
+    # Remove offset from x
+    x_norm -= x_norm[0]
+    # Scale x by xmax
+    x_norm /= x_norm.max()
+    data["x_norm"] = x_norm
+    return data
+
+
+def inflate_bbox(bbox, factor):
+    """Inflate a bounding box by given factor."""
+    bbox = np.array(bbox)
+    bbox_inflated = bbox.copy()
+    span_vec = bbox[1] - bbox[0]
+    mag = np.linalg.norm(span_vec)
+    ext = factor*mag*np.ones(3)
+    bbox_inflated[0] = bbox[0] - ext
+    bbox_inflated[1] = bbox[1] + ext
+    return bbox_inflated
+
+
+def load_stl_vertices(fpath):
+    """Load STL vertices and return as an N by 3 NumPy array."""
+    points = []
+    with open(fpath) as f:
+        for line in f.readlines():
+            line = line.split()
+            if line and line[0] == "vertex":
+                points.append([float(v) for v in line[1:]])
+    return np.array(points)
+
+
+def get_stl_bbox(fpath):
+    """Get bounding box from STL and return as a 2 x 3 NumPy array."""
+    points = load_stl_vertices(fpath)
+    xmin = points[:, 0].min()
+    xmax = points[:, 0].max()
+    ymin = points[:, 1].min()
+    ymax = points[:, 1].max()
+    zmin = points[:, 2].min()
+    zmax = points[:, 2].max()
+    return np.array([[xmin, ymin, zmin], [xmax, ymax, zmax]])
+
+
+def parse_batch_submit_output(input_txt):
+    """Parse output of batch submission script."""
+    d = {}
+    for line in input_txt.split("\n"):
+        line = line.strip()
+        if "CPUs:" in line:
+            d["cpus"] = int(line.split()[-1])
+        elif "Job Name:" in line:
+            d["jobname"] = line.split()[-1]
+        elif "Job Batch ID:" in line:
+            d["job_id"] = line.split()[-1]
+    return d
+
+
+def wait_for_batch_job(job_id, sleep_seconds=5):
+    """Wait for a batch job to finish."""
+    print("Waiting for job ID", job_id, "to finish")
+    done = False
+    while not done:
+        try:
+            done = job_id not in check_output("fqstat", shell=True).decode()
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(sleep_seconds)
+    print("Job ID", job_id, "finished")
+
+
+def submit_batch_job_and_wait(cmd, sleep_seconds=5):
+    """Submit a batch job and wait for it to complete."""
+    job_id = parse_batch_submit_output(
+        check_output(cmd, shell=True).decode()
+    )["job_id"]
+    wait_for_batch_job(job_id, sleep_seconds=sleep_seconds)
+
+
+def submit_self_batch_job(case_name=None, program_name=None, wait_for_job=None):
+    """Submit this application as a batch job."""
+    if case_name is None:
+        case_name = detect_case_name()
+    exe = os.path.abspath(sys.executable)
+    if not frozen:
+        args = os.path.join(top_dir, "run.py") + " "
+    else:
+        args = " "
+    sysargs = sys.argv.copy()
+    sysargs.remove("--all-batch")
+    args += " ".join(sysargs[1:])
+    cmd = 'runcustom -J {job} -x {exe} -a MODEFRONTIER -V 2014 -N 1 -p "{args}"'
+    if program_name is None:
+        program_name = detect_program_name()
+    if program_name is not None:
+        cmd += " -P " + program_name
+    if wait_for_job is not None:
+        cmd += " -Z " + str(wait_for_job)
+    cmd = cmd.format(job=case_name[:17] + "-post", exe=exe, args=args)
+    subprocess.call(cmd, shell=True)
+
+
+def get_program(case_dir):
+    files = glob.glob(os.path.join(case_dir, "*.hpc"))
+    program = "Unknown"
+    try:
+        for f in files:
+            txt = grep(" -P ", f, usegrep = True)
+            if(len(txt) > 0):
+                txt_ar = txt.split()
+                i = txt_ar.index("-P")
+                program = txt_ar[i+1]
+                break
+    except:
+        print("Warning: could not find program name in .hpc files")
+    return program
+
+#based on the last edit date of the oldest hpc file
+def get_run_date(case_dir):
+    files = glob.glob(os.path.join(case_dir, "*.hpc"))
+    times = []
+    last_time = "Unknown"
+    try:
+        for f in files:
+            ftime = os.path.getctime(f)
+            times.append(ftime)
+        last_time = time.ctime(times[0])
+    except:
+        print("Warning: could not find .hpc files to determine case time")
+    return(last_time)
+
+def get_rotating_wheels(case_dir, case_type):
+    rotating_wheels = "Unknown"
+    if(case_type == "iconCFD"):
+        try:
+            f = os.path.join(case_dir, "system/changeDictionaryDict")
+            txt = grep("omega", f, usegrep = True)
+            if(len(txt) > 0):
+                rotating_wheels = "True"
+            else:
+                rotating_wheels = "False"
+        except:
+            print("Warning: problem finding if wheels are rotating in system/changeDictionaryDict")
+    elif(case_type == "PowerFLOW"):
+        try:
+            f = os.path.join(case_dir, "logs/pflow-cdi-summary.log")
+            txt = grep("Rotating Wall:", f, usegrep = True)
+            if(len(txt) > 0):
+                rotating_wheels = "True"
+            else:
+                rotating_wheels = "False"
+        except:
+            print("Warning: progem finding if wheels are rotating in logs/pflow-cdi-summary.log")
+    return rotating_wheels
+
+
+def calc_frontal_area(case_dir = "./"):
+    try:
+        fpaths = ["images/geometry/area-front-area.png", "images/geom/front-area.png"]
+        for f in fpaths:
+            f = os.path.join(case_dir, f)
+            if(os.path.exists(f)):
+                fpath = f
+                break
+
+        #fpath = os.path.join(case_dir, "images/geometry/area-front-area.png")
+
+        image_data = imread(fpath)
+        image_data_bw = image_data.max(axis=2)
+        nrows, ncols = image_data_bw.shape
+
+        top_black =   np.any(image_data_bw[0,:] != 255)
+        bot_black =   np.any(image_data_bw[-1,:] != 255)
+        left_black =  np.any(image_data_bw[:,0] != 255)
+        right_black = np.any(image_data_bw[:,-1] != 255)
+        if(top_black or bot_black or left_black or right_black):
+            print("frontal view does not encompass vehicle, skipping area calculation")
+            return
+        area = float((image_data_bw != 255).sum())/float(2263520) #pixels per m^2 for the default frontal view
+    except:
+        print("couldn't find ./images/geometry/area-front-area.png, skipping frontal area calc")
+        area = 0
+    return np.round(area, decimals = 3)
+
+def summary(case_dir="./", verbose=False, write_csv=False, write_json=False,
+            write_html=False, as_series=True, part_forces=False,
+            compare_case_dirs=[], surface_reports=False, frontal_area=None,
+            forward_ave_start = None):
+    """Generate a summary of a case."""
+    cases = [case_dir] + compare_case_dirs
+    keys = ["fordcfd-post version", "Case name", "Working directory",
+            "Case type", "Solver version", "Steady/unsteady",
+            "Turbulence model", "Velocity (m/s)", "Time steps",
+            "Simulated time (s)", "Total run time (hr)", "CPUs",
+            "CPU hours", "Cells/voxels", "Max refinement",
+            "Max ref. cells/voxels", "Meshing time (hr)",
+            "Cd", "Cd err. (95% conf)", "Ref. Frontal area (m^2)", "Cd * Af",
+            "Cd porous", "Cl", "Cl err. (95% conf)", "Cl front", "Cl rear",
+            "Cs", "Cm pitch", "Cm yaw", "Cm roll",
+            "Program", "Run Date", "Rotating Wheels"]
+    df = pd.DataFrame(columns=keys)
+    for case in cases:
+        s = pd.Series()
+        s["fordcfd-post version"] = fordcfd.__version__
+        case_type = detect_case_type(case_dir=case)
+        if(case_type == "iconCFD"): keys.append("Number Failed Mesh Checks")
+        case_name = detect_case_name(case_dir=case, case_type=case_type)
+        s["Case name"] = case_name
+        s["Working directory"] = os.path.abspath(case)
+        s["Case type"] = case_type
+        s["Program"] = get_program(case)
+        s["Run Date"] = get_run_date(case)
+        s["Rotating Wheels"] = get_rotating_wheels(case, case_type)
+        s["Calc. Frontal area (m^2)"] = calc_frontal_area(case)
+        if case_type.lower() == "iconcfd":
+            d = fordcfd.icon.summary(case_dir=case, forward_ave_start = forward_ave_start)
+            for item in d['VPMS_fluxs']:
+                s[item[0]] = item[1]
+            #s['VPMS_fluxs'] = d['VPMS_fluxs']
+            d["Cells/voxels"] = d["Cells"]
+            d["Max ref. cells/voxels"] = d["Max refinement cells"]
+            if(d["Ref. Frontal area (m^2)"] != frontal_area and frontal_area != None):
+                old_area = d["Ref. Frontal area (m^2)"]
+                scalef = old_area/frontal_area
+                d["Cl"] *= scalef
+                d["Cd"] *= scalef
+                d["Cl front"] *= scalef
+                d["Cl rear"] *= scalef
+                d["Cs"] *= scalef
+                d["Cm pitch"] *= scalef
+                d["Cm yaw"] *= scalef
+                d["Cm roll"] *= scalef
+                d["Cd * Af"] =d["Cd"] * frontal_area
+                d["Ref. Frontal area (m^2)"] = frontal_area
+                d["Cl"] = np.round(d["Cl"], decimals = 4)
+                d["Cd"] = np.round(d["Cd"], decimals = 4)
+                d["Cl front"] = np.round(d["Cl front"], decimals = 4)
+                d["Cl rear"] = np.round(d["Cl rear"], decimals = 4)
+                d["Cs"] = np.round(d["Cs"], decimals = 4)
+                d["Cm pitch"] = np.round(d["Cm pitch"], decimals = 4)
+                d["Cm yaw"] = np.round(d["Cm yaw"], decimals = 4)
+                d["Cm roll"] = np.round(d["Cm roll"], decimals = 4)
+                d["Cd * Af"] = np.round(d["Cd * Af"], decimals = 4)
+
+        elif case_type.lower() == "powerflow":
+            d = fordcfd.pflow.summary(case_dir=case, frontal_area=frontal_area)
+            d["Cells/voxels"] = d["Voxels"]
+            d["Max refinement"] = d["Max VR"]
+            d["Max ref. cells/voxels"] = d["Fine equivalent voxels"]
+        elif case_type.lower() == "openfoam":
+            d = fordcfd.foam.summary(case_dir=case)
+            d["Cells/voxels"] = d["Cells"]
+            try:
+                d["Max ref. cells/voxels"] = d["Max refinement cells"]
+            except KeyError:
+                pass
+        case_type_modules = {"PowerFLOW": fordcfd.pflow,
+                     "iconCFD": fordcfd.icon,
+                     "OpenFOAM": fordcfd.foam}
+        if(forward_ave_start == None):
+            s['Averaging Start (s)'] =  case_type_modules[case_type].get_averaging_start_time(case)
+        else:
+            s['Averaging Start (s)'] = forward_ave_start
+        for k in keys:
+            if k in d.keys() and k not in s.keys():
+                s[k] = d[k]
+            elif k not in s.keys():
+                s[k] = ""
+        if verbose and not compare_case_dirs:
+            print("\nCase summary:\n")
+            print(s)
+        if case_type.lower() == "iconcfd" and part_forces:
+            fordcfd.icon.load_regional_forces(case_dir=case,
+                                              verbose=verbose,
+                                              write_csv=write_csv)
+        if case_type.lower() == "iconcfd" and surface_reports:
+            fordcfd.icon.load_all_mean_surface_reports(case_dir=case,
+                                                       verbose=verbose,
+                                                       write_csv=write_csv)
+        if write_csv:
+            try:
+                s.to_csv(os.path.join(case, "summary.csv"))
+            except PermissionError:
+                pass
+        if write_json:
+            try:
+                with open(os.path.join(case, "summary.json"), "w") as f:
+                    f.write(s.to_json())
+            except PermissionError:
+                pass
+        if write_html:
+            try:
+                pd.DataFrame(s).to_html(os.path.join(case, "summary.html"))
+            except PermissionError:
+                pass
+        if not compare_case_dirs:
+            if as_series:
+                return s
+            else:
+                return s.to_dict()
+        else:
+            df = df.append(s, ignore_index=True)
+    if compare_case_dirs:
+        if verbose:
+            print("\nMultiple case comparison:\n")
+            with pd.option_context("display.max_columns", 999):
+                print(df)
+        if write_csv:
+            try:
+                df.to_csv(os.path.join(case_dir, "summary-comparison.csv"),
+                          index=False)
+            except PermissionError:
+                pass
+        if write_html:
+            try:
+                df.to_html(os.path.join(case_dir, "summary-comparison.html"),
+                           index=False)
+            except PermissionError:
+                pass
+        return df
+
+
+def forward_average(time, arr, start_time=None):
+    """Compute an array showing evolution of the mean as more samples are
+    included.
+
+    Returns
+    -------
+    time : numpy.ndarray
+        Time array over which averaging was performed.
+    ave_arr : numpy.ndarray
+        Fordward-averaged array.
+    """
+    time_t = np.array(time)
+    arr = np.array(arr)
+    if start_time is not None:
+        arr = arr[time >= start_time]
+        time_t = time[time >= start_time]
+    t_samp = 1
+    try:
+        t_samp = calc_indept_samples(arr)
+    except:
+        print("error in calculating independent samples, assuming n_samp = 1")
+    i_sample = np.linspace(0,t_samp,len(arr))
+    interval = 1.0 - (1.0 - 0.95)/2.0
+    std_arr = scipy.stats.t.ppf(interval, t_samp)*np.array(pd.Series(arr).expanding(2).std(ddof=0))/np.sqrt(i_sample)
+    ave_arr = np.array(pd.Series(arr).expanding(0).mean())
+    return time_t, ave_arr, std_arr
+
+
+def two_tailed_t_score(confidence_interval, n):
+    """
+    Calculate the two-tailed t-score with the given confidence
+    interval (0 - 1.0) and number of samples
+    """
+
+    if confidence_interval is not None:
+        interval = 1.0 - (1.0 - confidence_interval)/2.0
+        return scipy.stats.t.ppf(interval, n-1)
+    else:
+        return 1.0
+
+
+def backward_average(time, arr, end_time=None):
+    """Compute an array showing evolution of the mean as more samples are
+    included stepping backward in time.
+
+    Returns
+    -------
+    time : numpy.ndarray
+        Time array over which averaging was performed.
+    ave_arr : numpy.ndarray
+        Backward-averaged array.
+    """
+    time = np.array(time)
+    arr = np.array(arr)
+    if end_time is not None:
+        arr = arr[time <= end_time]
+        time = time[time <= end_time]
+    ave_arr = np.zeros(len(arr))
+    std_arr = np.zeros(len(arr))
+    t_samp = calc_indept_samples(arr)
+    for n in range(len(arr)):
+        i_samp = max(t_samp*float((len(arr)- n)/len(arr)),1)
+        ave_arr[n] = arr[n:].mean()
+        std_arr[n] = calc_confidence_interval(arr[n:], interval = 0.95, i_samp = i_samp)
+    return time, ave_arr, std_arr
+
+
+def smooth(data):
+    """Smooth data with a 3rd order Butterworth filter."""
+    b, a = scipy.signal.butter(3, 7 / len(data))
+    fdata = scipy.signal.filtfilt(b, a, data)
+    return fdata
+
+def rebin(data, n_bins):
+    """
+    rebin data array to n_bins
+    """
+    if(len(data) <  n_bins):
+        return data
+    chunk_size = int(len(data)/n_bins)
+    N = int(len(data)/chunk_size)
+    data_rebinned = np.zeros(N)
+    for i in range(N):
+        data_rebinned[i] = np.average(data[i*chunk_size:(i+1)*chunk_size])
+    return data_rebinned
+
+def get_rr_var(x, n_bins):
+    """
+    Get the estimated variance of using repeat reference method
+
+    Keyword arguments:
+    x -- array to generate autocorrelation function of
+    n_bins -- number of bins to divite the signal into
+    """
+    data_rebinned = rebin(x, n_bins)
+    return np.var(data_rebinned)
+
+
+def get_mean_var(x, n_divs_max = 50):
+    """
+    Use method of Mockett to get the estimated variance in the mean
+
+    Keyword arguments:
+    x -- array to get variance of
+    n_divs_max -- maximum number of divisions to use to find B_min
+    """
+    x = x - np.mean(x)
+    n_divs_max = min(n_divs_max, len(x))
+    rr_var = np.zeros((n_divs_max))
+    var = np.var(x)
+    for i in range(3,n_divs_max):
+        t = float(len(x))/i
+        rr_var[i] = var/(2*t*get_rr_var(x, i))
+    B = np.min(rr_var[3:])
+    return var/(2*B*len(x))
+
+
+def calc_indept_samples(values):
+    """
+    Compute number of independent samples
+    """
+    var = get_mean_var(np.copy(values))
+    return np.var(values)/var
+
+def calc_mean_std_err(values):
+    """Calculate the standard error of the mean of a time series."""
+    values = np.array(values)
+    print(len(values))
+    if len(values) > 1:
+        n = calc_indept_samples(values)
+        err = values.std() / np.sqrt(n)
+    else:
+        err = np.nan
+    return err
+
+
+def calc_confidence_interval(values, interval = 0.95, i_samp = 1):
+    """Calculate the confidence interval of the mean of a time series."""
+    values = np.array(values)
+    if len(values) > 1:
+        err = (values.std() / np.sqrt(i_samp))*two_tailed_t_score(interval, i_samp)
+    else:
+        err = np.nan
+    return err
+
+def get_averaging_start_time(case_dir="./", case_type=None):
+    """Get the averaging start time for a given case."""
+    case_type_modules = {"PowerFLOW": fordcfd.pflow,
+                         "iconCFD": fordcfd.icon,
+                         "OpenFOAM": fordcfd.foam}
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    return case_type_modules[case_type].get_averaging_start_time(
+        case_dir=case_dir
+    )
+
+
+def diff_images(img1, img2, savepath=None):
+    """Highlight the differences between two images."""
+    dest_dir = os.path.dirname(savepath)
+    if not os.path.isdir(dest_dir):
+        os.makedirs(dest_dir)
+    img1 = imgdiff.Image.open(img1).convert("RGB")
+    img2 = imgdiff.Image.open(img2).convert("RGB")
+    # Create hack class to create options for imgdiff
+    class Options:
+        timeout = 10
+        opacity = 64
+        orientation = "auto"
+        spacing = 3
+        border = 0
+        bgcolor = (255, 255, 255)
+        sepcolor = (0, 0, 0)
+    opts = Options()
+    mask1, mask2 = imgdiff.simple_highlight(img1, img2, opts)
+    img = imgdiff.tile_images(img1, img2, mask1, mask2, opts)
+    if savepath is not None:
+        img.save(savepath)
+    return img
+
+
+def calc_spectral_density(t, data, window=None, n_band_average=1):
+    """Compute one-sided power spectral density, subtracting mean automatically.
+
+    Parameters
+    ----------
+    t : Time array
+    data : Time series data
+    window : {None, "Hanning"}
+    n_band_average : Number of samples over which to band average
+
+    Returns
+    -------
+    f : Frequency array
+    psd : Spectral density array
+    """
+    dt = t[1] - t[0]
+    N = len(data)
+    data = data - np.mean(data)
+    if window == "Hanning":
+        data = data*np.hanning(N)
+    f = np.fft.fftfreq(N, dt)
+    y = np.fft.fft(data)
+    f = f[0:N/2]
+    psd = (2*dt/N)*abs(y)**2
+    psd = np.real(psd[0:N/2])
+    if n_band_average > 1:
+        f_raw, s_raw = f*1, psd*1
+        f = np.zeros(len(f_raw)//n_band_average)
+        psd = np.zeros(len(f_raw)//n_band_average)
+        for n in range(len(f_raw)//n_band_average):
+            f[n] = np.mean(f_raw[n*n_band_average:(n+1)*n_band_average])
+            psd[n] = np.mean(s_raw[n*n_band_average:(n+1)*n_band_average])
+    return f, psd
+
+
+def get_free_stream_velocity(case_dir="./", case_type=None):
+    """Get free stream velocity."""
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_type.lower() == "powerflow":
+        return fordcfd.pflow.get_reference_velocity(case_dir=case_dir)
+    elif case_type.lower() == "openfoam":
+        return fordcfd.foam.get_free_stream_velocity(case_dir=case_dir)
+    elif case_type.lower() == "iconcfd":
+        return fordcfd.icon.get_free_stream_velocity(case_dir=case_dir)[0]
+    elif "ccm" in case_type.lower():
+        return fordcfd.ccm.get_reference_velocity(case_dir=case_dir)
+
+def get_free_stream_density(case_dir="./", case_type=None):
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    if case_type.lower() == "powerflow":
+        return fordcfd.pflow.get_reference_density(case_dir=case_dir)
+    elif case_type.lower() == "iconcfd":
+        return fordcfd.icon.get_rho_inf(case_dir=case_dir)
+
+def get_ref_frontal_area(case_dir="./", case_type=None):
+    if case_type is None:
+        case_type = detect_case_type(case_dir=case_dir)
+    elif case_type.lower() == "iconcfd":
+        return fordcfd.icon.get_ref_area(case_dir=case_dir)
+    elif case_type.lower() == "powerflow":
+        return fordcfd.pflow.get_ref_area(case_dir=case_dir)
