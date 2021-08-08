@@ -1,0 +1,112 @@
+import subprocess
+import sys
+import os
+import glob
+sys.path.append(os.path.dirname((os.path.dirname(__file__))))
+
+import matplotlib
+matplotlib.use("Agg")
+from fordcfd import plotting
+import smtplib, ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+def split_into_jobs(lines):
+    jobs = []
+    job = []
+    for (i,l) in enumerate(lines):
+        if(len(l) == 0 and i > 0):
+            jobs.append(job)
+            job = []
+        elif (i > 0):
+            job.append(l)
+        i += 1
+    return jobs
+
+def is_icon(j):
+    for l in j:
+        if('Application:      ICONCFD' in l):
+            return True
+    return False
+
+def get_job_progress(case_dir, job_id):
+    fpath = os.path.join(case_dir, "log/*.log")
+    recent_log = sorted(glob.glob(fpath), key = os.path.getmtime)[-1]
+    if(job_id in recent_log):
+        return recent_log.split("_")[-2]
+    else:
+        return "-"
+
+cmd = "fqstat -f"
+task = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE)
+data = task.stdout.read().decode('ascii')
+lines = data.split('\n')
+
+jobs = split_into_jobs(lines)
+jobs = [j for j in jobs if is_icon(j)]
+
+cases = []
+
+for j in jobs:
+    job_dict = {}
+    for l in j:
+        arr = l.split(":",1)
+        job_dict[arr[0]] = arr[1].strip()
+
+    try:
+        case_dir = job_dict['Run Directory']
+        if(job_dict['Job State'] == "Running" and get_job_progress(case_dir, job_id = job_dict['Job ID'].split(".")[0]) == "iconPisoFoam"):
+            cases.append(case_dir)
+    except:
+        pass
+
+
+plotting.plot_force_history(case_dir = cases[0], component="cd", compare_case_dirs=cases[1:],
+                                  case_type="IconCFD", savedir = ".",forward_average=True)
+plotting.plot_force_history(case_dir = cases[0], component="cl", compare_case_dirs=cases[1:],
+                                  case_type="IconCFD", savedir = ".", forward_average=True)
+plotting.plot_stabilization(case_dir = cases[0], component="cd", compare_case_dirs=cases[1:],
+                                  case_type="IconCFD", savedir = ".")
+plotting.plot_stabilization(case_dir = cases[0], component="cl", compare_case_dirs=cases[1:],
+                                  case_type="IconCFD", savedir = ".")
+
+plots = ["cd-history.png", "cl-history.png", "cd-history-zoom.png", "cl-history-zoom.png", "cd-stabilization.png", "cl-stabilization.png"]
+
+
+email_results = os.getcwd().split("/")[2]+"@ford.com"
+links = []
+for p in plots:
+    plot_path = os.path.abspath(os.path.join(os.getcwd(), p))
+    plot_path = "S:/" + "/".join(plot_path.split("/")[3:])
+    links.append("<a href = \" %s \"> here </a>" % plot_path)
+
+sender = email_results
+receiver = email_results
+
+message = MIMEMultipart("alternative")
+message["Subject"] = "CFD Results"
+message["From"] = sender
+message["To"] = receiver
+
+
+
+html = """\
+<html>
+<body>
+<p> C<sub>d</sub> History: %s </p>
+<p> C<sub>d</sub> History Zoom: %s </p>
+<p> C<sub>l</sub> History: %s </p>
+<p> C<sub>l</sub> History Zoom: %s </p>
+<p> C<sub>d</sub> stabilization plot: %s </p>
+<p>C<sub>l</sub> stabilization plot: %s </p>
+</body>
+</html>
+""" % (links[0], links[1], links[2], links[3], links[4], links[5])
+
+part2 = MIMEText(html, "html")
+message.attach(part2)
+
+s = smtplib.SMTP('localhost')
+s.sendmail(sender, receiver, message.as_string())
+s.quit()
