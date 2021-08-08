@@ -1,0 +1,700 @@
+"""OpenFOAM specific functions."""
+
+from __future__ import division, print_function
+import fordcfd
+import os
+import sys
+import numpy as np
+import glob
+import subprocess
+import pandas as pd
+from subprocess import check_output
+import time
+import warnings
+from sys import stdout
+
+_this_module = sys.modules[__name__]
+
+ras_model_aliases = {"kOmegaSST": "SST",
+                     "SpalartAllmaras": "SA",
+                     "realizableKE": "RKE",
+                     "hybridkOmegaSST": "Hybrid SST"}
+
+les_model_aliases = {"SpalartAllmaras": "DES",
+                     "SpalartAllmarasDDES": "DDES",
+                     "SpalartAllmarasIDDES": "IDDES",
+                     "kOmegaSSTDES": "SST-DES",
+                     "kOmegaSSTDDES": "SST-DDES",
+                     "kOmegaSSTIDDES": "SST-IDDES"}
+
+
+def read_single_line_value(keyword, fpath, dtype=str, occurrence=1,
+                           index=1, remove=[";"]):
+    """Find a single line value but allow macro substitution."""
+    try:
+        val = fordcfd.read_single_line_value(keyword, fpath, dtype=dtype,
+                                             occurrence=occurrence, index=index,
+                                             remove=remove)
+        return val
+    except ValueError:
+        val = fordcfd.read_single_line_value(keyword, fpath, dtype=str,
+                                             occurrence=occurrence, index=index,
+                                             remove=remove)
+        if val.startswith("$"):
+            keyword = val.replace("$", "")
+            val = fordcfd.read_single_line_value(keyword, fpath, dtype=dtype,
+                                                 occurrence=occurrence,
+                                                 index=index,
+                                                 remove=remove)
+            return val
+
+
+def multi_log_glob(log_glob):
+    """``glob`` for the input ``log_glob`` and one that uses the ``log`` dir."""
+    f = glob.glob(log_glob)
+    if not f:
+        f = glob.glob(log_glob.replace("log.", "log/") + ".log")
+    return f
+
+
+def steady_case(case_dir="./", fpath_rel="system/fvSchemes"):
+    """Detect if case is steady."""
+    fvschemes_fpath = os.path.join(case_dir, fpath_rel)
+    with open(fvschemes_fpath) as f:
+        for line in f.readlines():
+            line = line.strip()
+            if not line.startswith("//"):
+                line = line.replace(";", "")
+                line = line.split()
+                if len(line) >= 2:
+                    if line[0] == "default" and line[1] == "steadyState":
+                        return True
+    return False
+
+
+def unsteady_case(case_dir="./", fpath_rel="system/fvSchemes"):
+    """Detect if case is unsteady."""
+    return not steady_case(case_dir=case_dir, fpath_rel=fpath_rel)
+
+
+def get_mesh_time(case_dir="./", log_glob="log.*HexMesh"):
+    """Read *HexMesh log to determine total meshing time in seconds."""
+    try:
+        logpath = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    except ValueError:
+        raise FileNotFoundError("Cannot find mesh log with " + log_glob)
+    txt = fordcfd.grep("Finished meshing in", logpath).strip().split()
+    try:
+        return float(txt[-2])
+    except ValueError:
+        return np.nan
+
+
+def get_solver_times(case_dir="./", log_glob="log.*Foam"):
+    """Read simulated time, execution time, and clock time from solver log."""
+    logpaths = multi_log_glob(os.path.join(case_dir, log_glob))
+    logpaths = [l for l in logpaths if not "potential" in l]
+    try:
+        logpath = max(logpaths)
+    except ValueError:
+        raise FileNotFoundError("Cannot find solver log with " + log_glob)
+
+    txt = ""
+    n_steps = 0
+    with open(logpath) as f:
+        for line in f.readlines():
+            if 'Time =' in line:
+                txt += line
+    n_steps = txt.count("ExecutionTime")
+    txt = txt.strip().split("\n")
+
+    found_time = False
+    found_ectime = False
+    for line in reversed(txt):
+        line = line.split()
+        if line[0] == "Time":
+            time = float(line[-1])
+            found_time = True
+        elif line[0] == "ExecutionTime":
+            etime = float(line[2])
+            ctime = float(line[-2])
+            found_ectime = True
+        if found_time and found_ectime:
+            return {"Simulated time (s)": time,
+                    "Execution time (s)": etime,
+                    "Clock time (s)": ctime,
+                    "Execution time (hr)": etime/3600.0,
+                    "Clock time (hr)": ctime/3600.0,
+                    "Total run time (hr)": np.round(ctime/3600.0, decimals=1),
+                    "Number of Steps": n_steps}
+
+def get_number_of_cpus(case_dir="./"):
+    """Read number of CPUs from `decomposeParDict`"""
+    fpath = os.path.join(case_dir, "system", "decomposeParDict")
+    return read_single_line_value("numberOfSubdomains", fpath, dtype=int)
+
+
+def get_start_time(case_dir="./"):
+    """Get start time for simulation in seconds."""
+    fpath = os.path.join(case_dir, "system", "controlDict")
+    return read_single_line_value("startTime", fpath, dtype=float)
+
+
+def get_version(case_dir="./", log_glob="log.*Foam"):
+    """Parse the version number from the solver log."""
+    try:
+        solver_log = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    except ValueError:
+        raise FileNotFoundError("Cannot file solver log with " + log_glob)
+    txt = fordcfd.grep("Version:", solver_log)
+    return txt.strip().split()[-2]
+
+
+def get_refinement_info(case_dir="./", log_glob="log.*HexMesh"):
+    """Look for refinement info in snappy log."""
+    try:
+        log = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    except ValueError:
+        raise FileNotFoundError("Cannot find mesh log with " + log_glob)
+
+    txt = ""
+    with open(log) as f:
+        m = f.read()
+        i = m.rfind('Cells per refinement level:')
+        f.seek(i)
+        for l in range(13):
+            txt += f.readline()
+    txt = txt.split("\n")
+
+    level = []
+    number = []
+    for line in txt:
+        line = line.split()
+        try:
+            level.append(int(line[0]))
+            number.append(int(line[1]))
+        except (ValueError, IndexError):
+            pass
+    df = pd.DataFrame()
+    df["refinement_level"] = level
+    df["n_cells"] = number
+    return df
+
+
+def get_endtime(case_dir="./"):
+    """Get endTime in seconds."""
+    fpath = os.path.join(case_dir, "system", "controlDict")
+    return read_single_line_value("endTime", fpath, dtype=float)
+
+
+def get_current_solver_time(case_dir="./", log_glob="log.*Foam",
+                            n_tail_lines=800):
+    """Get current solver time in seconds."""
+    log_path = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    raw = check_output("tail -n{} {}".format(n_tail_lines, log_path),
+                       shell=True).decode()
+    lines = raw.split("\n")
+    lines.reverse()
+    for line in lines:
+        if line.startswith("Time ="):
+            return(float(line.split()[-1]))
+
+
+def get_current_clocktime(case_dir="./", log_glob="log.*Foam",
+                          n_tail_lines=200):
+    """Return clockTime in seconds.
+
+    Log line will look like:
+
+    ```
+        ExecutionTime = 86411.49 s  ClockTime = 86613 s
+    ```
+    """
+    log_path = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    raw = check_output("tail -n{} {} | grep clockTime -i".format(n_tail_lines,
+                       log_path), shell=True).decode()
+    lines = raw.split("\n")
+    lines.reverse()
+    line = lines[-1]
+    line = line.split()
+    return float(line[-2])
+
+
+def gen_stripped_lines(fpath):
+    with open(fpath) as f:
+        for line in f.readlines():
+            line = line.replace("(", "")
+            line = line.replace(")", "")
+            line = line.replace(",", " ")
+            yield line
+
+
+def get_frontal_area(case_dir="./"):
+    """Lookup frontal area defined for `forces` `functionObject`."""
+    controldict = os.path.join(case_dir, "system", "controlDict")
+    try:
+        return read_single_line_value("Aref", controldict, dtype=float)
+    except:
+        warnings.warn("Cannot read frontal area; using 1.0 m^2")
+        return 1.0
+
+
+def get_free_stream_velocity(case_dir="./"):
+    """Lookup free stream velocity in `controlDict`."""
+    controldict = os.path.join(case_dir, "system", "controlDict")
+    try:
+        return read_single_line_value("magUInf", controldict, dtype=float)
+    except:
+        warnings.warn("Cannot read free stream velocity; using 35.8 m/s")
+        return 35.8
+
+
+def get_ref_length(case_dir="./"):
+    """Lookup reference length in `controlDict`."""
+    controldict = os.path.join(case_dir, "system", "controlDict")
+    try:
+        return read_single_line_value("lRef", controldict, dtype=float)
+    except:
+        warnings.warn("Cannot read reference length; using 1.0 m")
+        return 1.0
+
+
+def get_density(case_dir="./"):
+    """Lookup reference density in `controlDict`."""
+    controldict = os.path.join(case_dir, "system", "controlDict")
+    try:
+        return read_single_line_value("rhoInf", controldict, dtype=float)
+    except:
+        warnings.warn("Cannot read reference density; using 1.2 kg/m^3")
+        return 1.2
+
+
+def get_ncells(case_dir="./", log_glob="log.*checkMesh*"):
+    """Search the checkMesh log for number of cells."""
+    try:
+        logpath = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    except ValueError:
+        raise FileNotFoundError("Cannot find log path with " + log_glob)
+    cmd = "grep cells: '{}'".format(logpath)
+    return int(check_output(cmd, shell=True).decode().split()[1])
+
+
+def get_averaging_start_time(case_dir="./"):
+    """Attempt to look up field averaging start time."""
+    try:
+        fpath = os.path.join(case_dir, "system", "controlDict")
+        cmd = "grep fieldAverage {fpath} -A 30 | grep timeStart | head -n1"
+        txt = check_output(cmd.format(fpath=fpath), shell=True).decode()
+        val = float(txt.replace(";", "").split()[-1])
+        return val
+    except IndexError:
+        try:
+            return read_single_line_value("averagingStartTime", fpath,
+                                          dtype=float)
+        except:
+            print("Warning: Cannot detect OpenFOAM averaging start time")
+            warnings.warn("Cannot detect averaging start time")
+            return 0.0
+
+
+def load_force_history(case_dir="./", of_version=None):
+    if of_version is None:
+        of_version = get_version(case_dir=case_dir)
+    coeffs_dir = os.path.join(case_dir, "postProcessing", "forceCoeffs")
+    forces_dir = os.path.join(case_dir, "postProcessing", "forces")
+    coeffs_present = os.path.isdir(coeffs_dir)
+    # Should probably use force coeffs if present
+    subdir = forces_dir
+    timedir = max(os.listdir(subdir))
+    fpath_glob = os.path.join(subdir, timedir, "force*.dat")
+    fpaths = sorted(glob.glob(fpath_glob))
+    fpaths = [f for f in fpaths if not "bin" in os.path.basename(f).lower()]
+    fpath = fpaths[-1]
+    data = np.loadtxt(gen_stripped_lines(fpath), unpack=False, skiprows=1)
+    time = data[:, 0]
+    if of_version in ["v1606+", "plus", "v1706"]:
+        drag_total = data[:, 1]
+        sideforce_total = data[:, 2]
+        lift_total = data[:, 3]
+        try:
+            drag_porous = data[:, 10]
+        except IndexError:
+            drag_porous = drag_total*np.nan
+        # Moment is now in a different file
+        fpath_glob = os.path.join(subdir, timedir, "moment*.dat")
+        fpaths = sorted(glob.glob(fpath_glob))
+        fpaths = [f for f in fpaths if not "bin" in os.path.basename(f).lower()]
+        fpath = fpaths[-1]
+        datam = np.loadtxt(gen_stripped_lines(fpath), unpack=False, skiprows=1)
+        mx, my, mz = data[:, 1], data[:, 2], data[:, 3]
+    else:
+        drag_total = data[:, 1] + data[:, 4] + data[:, 7]
+        drag_porous = data[:, 7]
+        sideforce_total = data[:, 2] + data[:, 5] + data[:, 8]
+        lift_total = data[:, 3] + data[:, 6] + data[:, 9]
+        mx = data[:, 10] + data[:, 13] + data[:, 16]
+        my = data[:, 11] + data[:, 14] + data[:, 17]
+        mz = data[:, 12] + data[:, 15] + data[:, 18]
+    # Lookup density, area, ref length, and free stream velocity
+    # Warn and use some default values if these can't be detected
+    controldict = os.path.join(case_dir, "system", "controlDict")
+    rho = get_density(case_dir=case_dir)
+    area = get_frontal_area(case_dir=case_dir)
+    u_infty = get_free_stream_velocity(case_dir=case_dir)
+    lref = get_ref_length(case_dir=case_dir)
+    df = pd.DataFrame()
+    df["time"] = time
+    df["cd"] = drag_total / (0.5 * rho * area * u_infty**2)
+    df["cd_porous"] = drag_porous / (0.5 * rho * area * u_infty**2)
+    df["cs"] = sideforce_total / (0.5 * rho * area * u_infty**2)
+    df["cl"] = lift_total / (0.5 * rho * area * u_infty**2)
+    df["cmx"] = mx / (0.5 * rho * area * lref * u_infty**2)
+    df["cmy"] = my / (0.5 * rho * area * lref * u_infty**2)
+    df["cmz"] = mz / (0.5 * rho * area * lref * u_infty**2)
+    # Calculate front and rear lift
+    moment = df.cmy
+    wheelbase = lref
+    df["cl_rear"] = df.cl/2 - df.cmy
+    df["cl_front"] = df.cl - df.cl_rear
+    return df
+
+
+def load_lift_drag_devel(case_dir="./", write_csv=True, of_version=None,
+                         **kwargs):
+    """Load both lift and drag development."""
+    if of_version is None:
+        of_version = get_version(case_dir=case_dir)
+    subdir = os.path.join(case_dir, "postProcessing", "forces")
+    timedir = max(os.listdir(subdir))
+    fpath_glob = os.path.join(subdir, timedir, "force*in*.dat")
+    fpath = max(glob.glob(fpath_glob))
+    # First get x-array
+    with open(fpath) as f:
+        x = None
+        for line in f.readlines():
+            line = line.strip()
+            if line.startswith("#") and "x co-ords" in line:
+                line = line.split(":")[-1]
+                x = [float(val) for val in line.split()]
+                break
+            else:
+                line = line.split()
+                if line[0] == "#" and line[1] == "bins":
+                    bins = int(line[-1])
+                elif line[0] == "#" and line[1] == "start":
+                    start = float(line[-1])
+                elif line[0] == "#" and line[1] == "delta":
+                    delta = float(line[-1])
+                    break
+        # Workaround for TotalSim bins output
+        if x is None:
+            x = np.arange(0, bins) * delta + start
+    data = np.loadtxt(gen_stripped_lines(fpath), unpack=False)
+    time = data[:, 0]
+    t1 = get_averaging_start_time(case_dir=case_dir)
+    if t1 is None or t1 >= time.max():
+        print("Using last half of time series for averaging force development")
+        t1 = time[len(time) // 2]
+    ind = time >= t1
+    # Average data
+    data = data[ind, :].mean(axis=0)
+    if of_version in ["v1606+", "plus", "v1706"]:
+        # Pad data with zeros to match with iconCFD output
+        nbins = len(x)
+        force_cols = len(data)
+        cols_per_loc = force_cols // nbins
+        total_lift = data[3::cols_per_loc]
+        total_drag = data[1::cols_per_loc]
+    else:
+        fx_press = data[1::18]
+        fx_visc = data[4::18]
+        fx_por = data[7::18]
+        fz_press = data[3::18]
+        fz_visc = data[6::18]
+        fz_por = data[9::18]
+        total_lift = fz_press + fz_visc + fz_por
+        total_drag = fx_press + fx_visc + fx_por
+    # Pad data with zeros to match with iconCFD output
+    dx = x[2] - x[1]
+    x0 = x[0] - dx
+    x = np.hstack((x0, x))
+    total_lift = np.hstack((0.0, total_lift))
+    total_drag = np.hstack((0.0, total_drag))
+    u_infty = get_free_stream_velocity(case_dir=case_dir)
+    area = get_frontal_area(case_dir=case_dir)
+    rho = get_density(case_dir=case_dir)
+    norm = 0.5 * rho * area * u_infty**2
+    df = pd.DataFrame()
+    df["x"] = x
+    df["cl"] = total_lift / norm
+    df["cd"] = total_drag / norm
+    if write_csv:
+        results_dir = os.path.join(case_dir, "results")
+        if not os.path.isdir(results_dir):
+            os.makedirs(results_dir)
+        fpath = os.path.join(results_dir, "force-devel.csv")
+        try:
+            df.to_csv(fpath, index=False)
+        except PermissionError:
+            pass
+    return df
+
+
+def get_display_patches(case_dir="./", include_patches=[]):
+    """Find patches that should or shouldn't be displayed in post-processing.
+    """
+    polymesh_dir = os.path.join(case_dir, "processor0", "0", "polyMesh")
+    if not os.path.isdir(polymesh_dir):
+        polymesh_dir = os.path.join(case_dir, "constant", "polyMesh")
+    try:
+        boundary_file = glob.glob(os.path.join(polymesh_dir, "boundary"))[0]
+    except IndexError:
+        try:
+            boundary_file = glob.glob(
+                os.path.join(polymesh_dir, "boundary.gz")
+            )[0]
+        except IndexError:
+            try:
+                boundary_file = glob.glob(
+                    os.path.join(case_dir,
+                                 "processor0",
+                                 "constant",
+                                 "polyMesh",
+                                 "boundary")
+                )[0]
+            except IndexError:
+                print("Cannot find boundary definition file")
+                return {True: [], False: []}
+    grep_cmd = "grep"
+    if boundary_file.endswith(".gz"):
+        grep_cmd = "zgrep"
+    # Partial matching keywords
+    display_kws = {False: ["BBIN", "BBOUT", "BBWAL", "BND", "frictionDistance", "VMRF"],
+                   True: ["GEOM", "GOPT", "GRWS", "Ahmed", "car", "truck",
+                          "body", "Body"] + include_patches}
+    display_patches = {}
+    for disp, kws in display_kws.items():
+        display_patches[disp] = []
+        for kw in kws:
+            cmd = "{} {} {}".format(grep_cmd, kw, boundary_file)
+            try:
+                grep_txt = subprocess.check_output(cmd, shell=True).decode()
+            except subprocess.CalledProcessError:
+                grep_txt = ""
+            if grep_txt:
+                for line in grep_txt.strip().split("\n"):
+                    line = line.strip()
+                    if len(line.split()) == 1:
+                        if not line in display_patches[disp]:
+                            display_patches[disp].append(line)
+    # Full word matches (case insensitive)
+    grep_cmd_full = grep_cmd + " -wi"
+    display_words_full = {False: ["inlet", "outlet", "slip", "wall", "walls",
+                                  "floor"]}
+    for disp, kws in display_words_full.items():
+        for kw in kws:
+            cmd = "{} {} {}".format(grep_cmd_full, kw, boundary_file)
+            try:
+                grep_txt = subprocess.check_output(cmd, shell=True).decode()
+            except subprocess.CalledProcessError:
+                grep_txt = ""
+            if grep_txt:
+                for line in grep_txt.strip().split("\n"):
+                    line = line.strip()
+                    if len(line.split()) == 1:
+                        if not line in display_patches[disp]:
+                            display_patches[disp].append(line)
+    return display_patches
+
+
+def summary(case_dir="./"):
+    """Summarize an OpenFOAM case."""
+    d = {"Case type": "OpenFOAM"}
+    d["Case name"] = fordcfd.detect_case_name(case_dir=case_dir)
+    d["Solver version"] = get_version(case_dir=case_dir)
+    d["Turbulence model"] = get_turbulence_model(case_dir=case_dir)
+    d.update(get_solver_times(case_dir=case_dir))
+    d["Working directory"] = os.path.abspath(case_dir)
+    d["CPUs"] = get_number_of_cpus(case_dir=case_dir)
+    d["CPU hours"] = np.round(d["CPUs"] * d["Clock time (hr)"], decimals=1)
+    d["Cells"] = get_ncells(case_dir=case_dir)
+    d["Velocity (m/s)"] = get_free_stream_velocity(case_dir=case_dir)
+    d["Ref. Frontal Area (m^2)"] = get_frontal_area(case_dir=case_dir)
+    if steady_case(case_dir=case_dir):
+        d["Steady/unsteady"] = "steady"
+        d["Simulated time (s)"] = "N/A"
+    else:
+        d["Steady/unsteady"] = "unsteady"
+    try:
+        ref_info = get_refinement_info(case_dir=case_dir)
+        d["Max refinement"] = ref_info.refinement_level.iloc[-1]
+        d["Max refinement cells"] = ref_info.n_cells.iloc[-1]
+        d["Meshing time (hr)"] = np.round(get_mesh_time(case_dir=case_dir)/3600,
+                                          decimals=1)
+    except FileNotFoundError:
+        # Couldn't find meshing log
+        pass
+    # Add forces summary
+    try:
+        forces = load_force_history(case_dir=case_dir)
+        d["Time steps"] = len(forces["time"])
+        t1 = get_averaging_start_time(case_dir=case_dir)
+        if forces.time.max() <= t1:
+            t1 = forces.time.iloc[len(forces) // 2]
+        mean_forces = forces[forces.time >= t1].mean(axis=0).round(decimals=3)
+        d["Mean Cd"] = mean_forces.cd
+        d["Mean Cl"] = mean_forces.cl
+        d["Cl"] = d["Mean Cl"]
+        d["Cd"] = d["Mean Cd"]
+        d["Cd std. err."] = np.round(
+            fordcfd.calc_mean_std_err(forces[forces.time >= 1]["cd"]),
+            decimals=3
+        )
+        d["Cl std. err."] = np.round(
+            fordcfd.calc_mean_std_err(forces[forces.time >= 1]["cl"]),
+            decimals=3
+        )
+        d["Cl front"] = mean_forces.cl_front
+        d["Cl rear"] = mean_forces.cl_rear
+        d["Cs"] = mean_forces.cs
+        d["Cm pitch"] = mean_forces.cmy
+        d["Cm yaw"] = mean_forces.cmz
+        d["Cm roll"] = mean_forces.cmx
+        d["Cd * Af"] = np.round(d["Cd"] * d["Ref. Frontal area (m^2)"], decimals=3)
+        d["Cd porous"] = mean_forces.cd_porous
+    except FileNotFoundError:
+        # Couldn't load forces file
+        pass
+    return d
+
+
+def print_status(case_dir="./", module=_this_module):
+    """Print percent complete, CPU hrs/s, and current mean Cd."""
+    steady = steady_case(case_dir=case_dir)
+    solver_times = module.get_solver_times(case_dir=case_dir)
+    current_time = solver_times["Simulated time (s)"]
+    endtime = module.get_endtime(case_dir=case_dir)
+    percent_done = current_time/endtime*100
+    clocktime_hrs = solver_times["Clock time (hr)"]
+    nproc = module.get_number_of_cpus(case_dir=case_dir)
+    cpu_hrs = clocktime_hrs*nproc
+    cpu_hrs_per_sec = cpu_hrs/current_time
+    seconds_left = endtime - current_time
+    cpu_hrs_left = cpu_hrs_per_sec*seconds_left
+    hrs_left = cpu_hrs_left/nproc
+    df = module.load_force_history(case_dir=case_dir)
+    cd = df["cd"]
+    cl = df["cl"]
+    time = df["time"]
+    ave_start_time = module.get_averaging_start_time(case_dir=case_dir)
+    cd_std_err = None
+    cl_std_err = None
+    nsamps = None
+    if time.max() > ave_start_time:
+        cd = cd[time >= ave_start_time]
+        cl = cl[time >= ave_start_time]
+        ns_cd = fordcfd.calc_indept_samples(cd)
+        cd_std_err = fordcfd.calc_confidence_interval(cd, interval = 0.95, i_samp = ns_cd)
+        ns_cl = fordcfd.calc_indept_samples(cl)
+        cl_std_err = fordcfd.calc_confidence_interval(cl, interval = 0.95, i_samp = ns_cl)
+        #cd_std_err = fordcfd.calc_mean_std_err(cd)
+        #cl_std_err = fordcfd.calc_mean_std_err(cl)
+    else:
+        # If unsteady, use final 2/3; if steady, use final 1/4
+        n = len(cd)
+        if steady:
+            i0 = int(n * 0.75)
+        else:
+            i0 = int(n * 1/3)
+        cd = cd[i0:]
+    mean_cd = cd.mean()
+    txt = "[{:.1f}%] -".format(percent_done)
+    if not steady:
+        txt += " {:d} CPU hr/s -".format(int(cpu_hrs_per_sec))
+    txt += " {:.1f} hr remaining - Cd: {:.3f} ".format(hrs_left, mean_cd)
+    if cd_std_err is not None:
+        txt += "+/- {:.4f}".format(cd_std_err)
+    stdout.write("\r" + txt)
+    stdout.flush()
+    return {"steady": steady,
+            "cd_std_err": cd_std_err,
+            "cl_std_err": cl_std_err,
+            "n_indept_samples": nsamps,
+            "time": time[-1]}
+
+
+def monitor(case_dir="./", autostop=False, cd_threshold=0.002,
+            cl_threshold=0.004, module=_this_module):
+    """Continuously monitor an OpenFOAM case.
+
+    If ``autostop`` is activated, the run will be ended if these conditions are
+    met:
+
+    * Drag coefficient at or below threshold
+    * Lift coefficient at or below threshold
+    * Simulation time is beyond averaging start time
+    """
+    while True:
+        info = module.print_status(case_dir=case_dir)
+        cl_std_err = info["cl_std_err"]
+        cd_std_err = info["cd_std_err"]
+        run_time = info["time"]
+        if cd_std_err is not None and cl_std_err is not None and autostop:
+            if (cl_std_err <= cl_threshold) and (cd_std_err <= cd_threshold) and (run_time > 1.5):
+                print("\nAutomatically stopping run")
+                module.stop_run(case_dir=case_dir)
+                break
+        time.sleep(60)
+
+
+def stop_run(case_dir="./", log_glob="log.*Foam"):
+    """Stops run by editing `controlDict`."""
+    fpath = os.path.join(case_dir, "system", "controlDict")
+    with open(fpath) as f:
+        txt_old = f.read()
+    txt = txt_old + "\nstopAt writeNow;\n"
+    with open(fpath, "w") as f:
+        f.write(txt)
+    # Wait to make sure run stops
+    solver_stopped = False
+    log_fpath = max(multi_log_glob(os.path.join(case_dir, log_glob)))
+    while not solver_stopped:
+        time.sleep(1)
+        try:
+            txt = subprocess.check_output(
+                "tail {} | grep End".format(log_fpath), shell=True
+            ).decode()
+            if "End" in txt:
+                solver_stopped = True
+        except subprocess.CalledProcessError:
+            pass
+    # Rewrite original controlDict
+    with open(fpath, "w") as f:
+        f.write(txt_old)
+
+
+def get_turbulence_model(case_dir="./", return_alias=True):
+    """Detect turbulence model name."""
+    # First, detect which type of model we're using
+    model_type = read_single_line_value(
+        "simulationType",
+        os.path.join(case_dir, "constant", "turbulenceProperties")
+    )
+    if "RASModel" in model_type:
+        model = read_single_line_value(
+            "RASModel",
+            os.path.join(case_dir, "constant", "RASProperties")
+        )
+        if return_alias and model in ras_model_aliases.keys():
+            return ras_model_aliases[model]
+        else:
+            return model
+    elif "LESModel" in model_type:
+        model = read_single_line_value(
+            "LESModel",
+            os.path.join(case_dir, "constant", "LESProperties")
+        )
+        if return_alias and model in les_model_aliases.keys():
+            return les_model_aliases[model]
+        else:
+            return model
